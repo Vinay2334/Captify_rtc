@@ -1,0 +1,22 @@
+{
+  "name": "extensionrtc",
+  "version": "1.0.0",
+  "description": "Port of the socket-based `Extension/` build. The audio **processing** chain is unchanged; only the **transport** changed from WebSocket to WebRTC.",
+  "main": "src/offscreen.js",
+  "scripts": {
+    "dev": "vite build --watch --mode development",
+    "build": "vite build",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "devDependencies": {
+    "vite": "^8.3.5"
+  },
+  "dependencies": {
+    "@ricky0123/vad-web": "^0.0.31",
+    "onnxruntime-web": "^1.30.0"
+  }
+}

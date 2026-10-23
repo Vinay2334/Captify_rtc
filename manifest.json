@@ -1,0 +1,25 @@
+{
+  "name": "Tab Capture - Recorder (WebRTC)",
+  "description": "Records the current tab in an offscreen document and streams audio over WebRTC.",
+  "version": "1",
+  "manifest_version": 3,
+  "minimum_chrome_version": "116",
+  "action": {
+    "default_icon": "icons/not-recording.png"
+  },
+  "content_security_policy": {
+    "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'; connect-src http://127.0.0.1:8000/; "
+  },
+  "background": {
+    "service_worker": "service-worker.js",
+    "type": "module"
+  },
+  "permissions": ["tabCapture", "offscreen", "downloads"],
+  "host_permissions": ["http://127.0.0.1:8000/*"],
+  "web_accessible_resources": [
+    {
+      "resources": ["recorder-processor.js"],
+      "matches": ["<all_urls>"]
+    }
+  ]
+}
