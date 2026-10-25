@@ -168,6 +168,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         case "stop-recording":
           if (message.tabId == null) {
             // Legacy global stop (old service worker): stop everything.
+            console.warn("stop-recording with no tabId: stopping all sessions");
             await stopAllRecordings();
           } else {
             await stopRecording(message.tabId);

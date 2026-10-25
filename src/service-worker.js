@@ -12,7 +12,7 @@ const recordingTabs = new Set();
 async function ensureCaptionScript(tabId) {
   try {
     await chrome.scripting.executeScript({
-      target: { tabId },
+      target: { tabId, allFrames: false },
       files: ["content-script.js"],
     });
   } catch (e) {
@@ -34,7 +34,7 @@ async function sendToTab(tabId, message) {
 async function ensureOffscreen() {
   const existingContexts = await chrome.runtime.getContexts({});
   const offscreenDocument = existingContexts.find(
-    (c) => c.contextType === "OFFSCREEN_DOCUMENT"
+    (c) => c.contextType === "OFFSCREEN_DOCUMENT",
   );
   if (!offscreenDocument) {
     await chrome.offscreen.createDocument({
@@ -87,12 +87,16 @@ async function reconcileRecordingTabs() {
               tabId,
             });
           } catch (stopError) {
-            console.warn("orphan stop failed:", stopError?.message || stopError);
+            console.warn(
+              "orphan stop failed:",
+              stopError?.message || stopError,
+            );
           }
         }
       }
     }
   } catch (e) {
+    console.warn("get-recordings delivery failed:", e?.message || e);
     // No offscreen document yet — nothing to reconcile.
   }
 }
@@ -107,7 +111,7 @@ async function stopTabRecording(tabId) {
   } catch (e) {
     console.warn("stop-recording delivery failed:", e?.message || e);
   }
-  await sendToTab(tabId, { type: "caption-clear" });
+  await sendToTab(tabId, { type: "caption-teardown" });
   recordingTabs.delete(tabId);
   try {
     await chrome.action.setIcon({ path: "icons/not-recording.png", tabId });
@@ -121,10 +125,8 @@ async function stopTabRecording(tabId) {
 chrome.action.onClicked.addListener(async (tab) => {
   if (tab?.id == null) return;
   await reconcileRecordingTabs();
-
   // Toggle recording for the clicked tab only; other tabs keep recording.
   if (recordingTabs.has(tab.id)) {
-    console.log("stop recording for tab", tab.id);
     await stopTabRecording(tab.id);
     return;
   }
@@ -187,6 +189,18 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo) => {
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   (async () => {
+    if (message.type === "caption-close") {
+      // Close button clicked inside the tab's subtitle menu bar:
+      // stop this tab's offscreen recording session and tear down offscreen.html
+      // once no tabs remain recording.
+      const tabId = message.tabId ?? sender?.tab?.id;
+      await reconcileRecordingTabs();
+      if (tabId != null) {
+        await stopTabRecording(tabId);
+      }
+      sendResponse?.({ ok: true });
+      return;
+    }
     if (message.type === "caption-language") {
       // Dropdown picks from a tab's subtitle window. The content script has
       // no tabId of its own, so identify the tab from the message sender.
@@ -213,10 +227,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         url: url,
         filename: "recording.webm", // Specify the filename for the download
       });
-    } else if (
-      message.type === "caption" ||
-      message.type === "caption-clear"
-    ) {
+    } else if (message.type === "caption" || message.type === "caption-clear") {
       // Live transcript from one tab's session in the offscreen document:
       // relay to that tab's caption overlay. Not awaited by the sender
       // (best-effort). Messages without a tabId (old offscreen builds) fall
