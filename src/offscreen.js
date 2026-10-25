@@ -5,83 +5,313 @@
 // Only the transport changed: the WebSocket is gone. Chunks are sent over a
 // reliable, ordered RTCDataChannel on an RTCPeerConnection negotiated with
 // the backend via HTTP signaling (see rtc-config.js SIGNAL_URL).
+//
+// Multi-tab: Chrome MV3 allows only ONE offscreen document per extension, so
+// this single document hosts one independent session per recording tab,
+// keyed by tabId. Each session owns its MediaStream, recorder nodes, VAD
+// instance, RTCPeerConnection/DataChannel, and caption buffers. All recorder
+// chains share one AudioContext (see below); MicVAD keeps one context per
+// session because it re-registers its worklet processor on every start.
 
 import { RTC_CONFIG } from "./rtc-config.js";
 import { MicVAD } from "@ricky0123/vad-web";
 
-chrome.runtime.onMessage.addListener(async (message) => {
-  if (message.target === "offscreen") {
-    switch (message.type) {
-      case "start-recording":
-        startRecording(message.data);
-        break;
-      case "stop-recording":
-        stopRecording();
-        break;
-      default:
-        throw new Error("Unrecognized message:", message.type);
-    }
-  }
-});
-
-let recorderNode;
-let mediaStreamSource;
-let audioContext;
-let mediaStream;
-
-let peerConnection = null;
-let audioChannel = null;
-
 // Chunks produced before the DataChannel opens are queued, then flushed on
 // "open" (the socket build just dropped them with an error). Bounded so a
 // failed negotiation can't grow memory without limit (~10 s at 200 ms/chunk).
-let pendingChunks = [];
 const MAX_PENDING_CHUNKS = 50;
-
-let vad = null;
-let speechActive = false;
-
-const preRollChunks = [];
 const PRE_ROLL_CHUNKS = 2;
 
 const assetBase = chrome.runtime.getURL("vad-assets/");
 
-let connectionPromise = null;
+const sessions = new Map();
 
-async function ensureConnection() {
+// One AudioContext shared by every tab's recorder chain
+// (MediaStreamSource -> "recorder-processor" AudioWorkletNode). Previously
+// each session built its own, so N tabs meant N contexts plus N more inside
+// MicVAD; now the recorder side costs one context total.
+//
+// MicVAD is deliberately excluded from sharing: each MicVAD.start() calls
+// audioWorklet.addModule() for its helper worklet, and registering the same
+// processor name twice on one context throws (InvalidStateError) with no
+// opt-out in the library. One shared context for our own module is safe
+// because we add it exactly once per context lifetime (flag below).
+let sharedAudioContext = null;
+let recorderModuleAdded = false;
+
+async function getSharedAudioContext() {
+  if (!sharedAudioContext || sharedAudioContext.state === "closed") {
+    sharedAudioContext = new AudioContext();
+    recorderModuleAdded = false;
+  }
+  if (sharedAudioContext.state === "suspended") {
+    try {
+      await sharedAudioContext.resume();
+    } catch (e) {
+      console.warn("Shared AudioContext resume failed:", e);
+    }
+  }
+  if (!recorderModuleAdded) {
+    await sharedAudioContext.audioWorklet.addModule("recorder-processor.js");
+    recorderModuleAdded = true;
+  }
+  return sharedAudioContext;
+}
+
+// Close the shared context only once the last session is gone. Per-tab stop
+// just disconnects that tab's nodes and leaves the context running.
+async function releaseSharedAudioContext() {
+  if (sessions.size === 0 && sharedAudioContext) {
+    const ctx = sharedAudioContext;
+    sharedAudioContext = null;
+    recorderModuleAdded = false;
+    try {
+      await ctx.close();
+    } catch (e) {
+      console.warn("Shared AudioContext close failed:", e);
+    }
+  }
+}
+
+function createSession(tabId) {
+  return {
+    tabId,
+    recorderNode: null,
+    mediaStreamSource: null,
+    audioContext: null,
+    mediaStream: null,
+    peerConnection: null,
+    audioChannel: null,
+    pendingChunks: [],
+    preRollChunks: [],
+    vad: null,
+    speechActive: false,
+    transcriptBuffers: new Map(),
+    currentItemId: null,
+    currentText: "",
+    connectionPromise: null,
+    // Language pair picked in the tab's subtitle window. Sent to the backend
+    // over the DataChannel (see sendLangConfig).
+    langConfig: null,
+    // Control payloads queued while the DataChannel is not open yet.
+    pendingControl: [],
+  };
+}
+
+// Language picks that arrived before their tab's session existed (the
+// content script announces its defaults on load, which can predate
+// start-recording). Applied when the session is created.
+const pendingLangConfig = new Map();
+
+function langPayload(config) {
+  return JSON.stringify({
+    type: "language-config",
+    source_lang: config.source,
+    target_lang: config.target,
+  });
+}
+
+function flushPendingControl(session) {
+  while (
+    session.pendingControl.length &&
+    session.audioChannel?.readyState === "open"
+  ) {
+    session.audioChannel.send(session.pendingControl.shift());
+  }
+}
+
+function sendLangConfig(session) {
+  if (!session.langConfig) return;
+  const payload = langPayload(session.langConfig);
+  if (session.audioChannel?.readyState === "open") {
+    try {
+      session.audioChannel.send(payload);
+      return;
+    } catch (e) {
+      console.warn("language-config send failed, queueing:", e);
+    }
+  }
+  if (session.pendingControl.length > 4) session.pendingControl.shift();
+  session.pendingControl.push(payload);
+}
+
+function applyLangConfig(tabId, config) {
+  pendingLangConfig.set(tabId, config);
+  const session = sessions.get(tabId);
+  if (session) {
+    session.langConfig = config;
+    sendLangConfig(session);
+  }
+}
+
+function updateRecordingHash() {
+  window.location.hash = sessions.size > 0 ? "recording" : "";
+}
+
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message?.target !== "offscreen") return false;
+
+  if (message.type === "get-recordings") {
+    sendResponse({ tabIds: [...sessions.keys()] });
+    return false;
+  }
+
+  (async () => {
+    try {
+      switch (message.type) {
+        case "start-recording":
+          if (message.tabId == null) {
+            throw new Error("start-recording missing tabId");
+          }
+          await startRecording(message.tabId, message.data);
+          break;
+        case "stop-recording":
+          if (message.tabId == null) {
+            // Legacy global stop (old service worker): stop everything.
+            await stopAllRecordings();
+          } else {
+            await stopRecording(message.tabId);
+          }
+          break;
+        case "caption-language":
+          if (message.tabId == null) {
+            throw new Error("caption-language missing tabId");
+          }
+          applyLangConfig(message.tabId, {
+            source: message.source,
+            target: message.targetLang,
+          });
+          break;
+        default:
+          if (message.type === "caption" || message.type === "caption-clear") {
+            // Our own caption broadcasts (echoed to all contexts); ignore.
+            break;
+          }
+          throw new Error("Unrecognized message:", message.type);
+      }
+    } catch (e) {
+      console.error(`offscreen ${message.type} failed:`, e);
+    }
+  })();
+  return false;
+});
+
+function broadcastCaption(session, text, itemId, isFinal) {
+  try {
+    chrome.runtime.sendMessage({
+      type: "caption",
+      target: "captions",
+      tabId: session.tabId,
+      text,
+      item_id: itemId,
+      final: isFinal,
+    });
+  } catch (e) {
+    // Service worker may be gone during teardown; captions are best-effort.
+    console.warn("Failed to broadcast caption:", e);
+  }
+}
+
+function clearCaptions(session) {
+  session.transcriptBuffers.clear();
+  session.currentItemId = null;
+  session.currentText = "";
+  try {
+    chrome.runtime.sendMessage({
+      type: "caption-clear",
+      target: "captions",
+      tabId: session.tabId,
+    });
+  } catch (e) {
+    console.warn("Failed to clear captions:", e);
+  }
+}
+
+function handleServerMessage(session, raw) {
+  let msg;
+  try {
+    msg = typeof raw === "string" ? JSON.parse(raw) : JSON.parse(raw);
+  } catch (e) {
+    console.warn("Ignoring non-JSON DataChannel message:", raw);
+    return;
+  }
+
+  if (msg.type === "transcript.delta") {
+    const prev = session.transcriptBuffers.get(msg.item_id) || "";
+    const next = prev + (msg.delta || "");
+    session.transcriptBuffers.set(msg.item_id, next);
+    session.currentItemId = msg.item_id;
+    session.currentText = next;
+    broadcastCaption(session, session.currentText, session.currentItemId, false);
+  } else if (msg.type === "transcript.completed") {
+    const transcript = msg.transcript || "";
+    if (transcript) {
+      session.transcriptBuffers.set(msg.item_id, transcript);
+      session.currentItemId = msg.item_id;
+      session.currentText = transcript;
+      broadcastCaption(session, session.currentText, session.currentItemId, true);
+    } else if (msg.item_id === session.currentItemId || !transcript) {
+      // Empty completion (silence/VAD artifact): hide a stale line rather
+      // than flashing an empty box.
+      session.transcriptBuffers.delete(msg.item_id);
+      if (msg.item_id === session.currentItemId) {
+        session.currentItemId = null;
+        session.currentText = "";
+        broadcastCaption(session, "", msg.item_id, true);
+      }
+    }
+  } else if (msg.type === "error") {
+    console.warn("Transcription server error:", msg.code, msg.message);
+  } else {
+    console.log("DataChannel message received:", raw);
+  }
+}
+
+async function ensureConnection(session) {
   if (
-    peerConnection?.connectionState === "connected" &&
-    audioChannel?.readyState === "open"
+    session.peerConnection?.connectionState === "connected" &&
+    session.audioChannel?.readyState === "open"
   ) {
     return;
   }
 
-  if (connectionPromise) {
-    return connectionPromise;
+  if (session.connectionPromise) {
+    return session.connectionPromise;
   }
 
-  connectionPromise = (async () => {
-    await teardownPeerConnection();
-    await setupPeerConnection();
+  session.connectionPromise = (async () => {
+    await teardownPeerConnection(session);
+    await setupPeerConnection(session);
   })();
 
   try {
-    await connectionPromise;
+    await session.connectionPromise;
   } finally {
-    connectionPromise = null;
+    session.connectionPromise = null;
   }
 }
 
-async function startRecording(streamId) {
-  if (recorderNode) {
-    throw new Error("Called startRecording while recording is in progress.");
+async function startRecording(tabId, streamId) {
+  let session = sessions.get(tabId);
+  if (session?.recorderNode) {
+    throw new Error(
+      `Called startRecording while recording is in progress for tab ${tabId}.`
+    );
   }
+  if (!session) {
+    session = createSession(tabId);
+    sessions.set(tabId, session);
+    updateRecordingHash();
+  }
+  // Picks announced before this session existed (content-script defaults).
+  const knownLang = pendingLangConfig.get(tabId);
+  if (knownLang) session.langConfig = knownLang;
 
   // Set up the peer connection FIRST, before any audio await, mirroring how
   // the socket build opened its WebSocket first so transport failures surf
   // even if getUserMedia/audio setup below throws.
   try {
-    await ensureConnection();
+    await ensureConnection(session);
 
     const stream = await navigator.mediaDevices.getUserMedia({
       audio: {
@@ -91,98 +321,126 @@ async function startRecording(streamId) {
         },
       },
     });
-    mediaStream = stream;
+    session.mediaStream = stream;
 
-    vad = await MicVAD.new({
+    // A capture track can fire "ended" during a silent stretch with no
+    // detectable audio (or a transient capture gap) while the user still
+    // wants translation. Never tear the session down here: the document
+    // and session stay up until the user explicitly stops translation
+    // (action toggle -> explicit stop-recording) or the tab goes away
+    // (the service worker sends an explicit stop-recording for that tab).
+    // If audio resumes on this stream it keeps flowing; if the track is
+    // truly dead the session idles until the explicit stop arrives.
+    const tabIdForClosure = tabId;
+    for (const track of stream.getTracks()) {
+      track.addEventListener("ended", () => {
+        console.warn(
+          `Capture track ended for tab ${tabIdForClosure}; keeping session open until explicit stop.`
+        );
+      });
+    }
+
+    session.vad = await MicVAD.new({
       model: "v5",
       baseAssetPath: assetBase,
       onnxWASMBasePath: assetBase,
       getStream: async () => stream,
       pauseStream: async () => {},
-      async onSpeechStart() {
-        speechActive = true;
+      onSpeechStart: async () => {
+        session.speechActive = true;
         console.log("Speech detected");
         try {
-          await ensureConnection();
-          while (preRollChunks.length > 0) {
-            sendChunk(preRollChunks.shift());
+          await ensureConnection(session);
+          while (session.preRollChunks.length > 0) {
+            sendChunk(session, session.preRollChunks.shift());
           }
         } catch (error) {
           console.error("Failed to reconnect on speech:", error);
         }
       },
       onSpeechEnd() {
-        speechActive = false;
+        session.speechActive = false;
         console.log("Speech ended");
       },
     });
 
-    vad.start();
+    session.vad.start();
 
-    audioContext = new AudioContext();
-    await audioContext.audioWorklet.addModule("recorder-processor.js");
+    session.audioContext = await getSharedAudioContext();
 
-    mediaStreamSource = audioContext.createMediaStreamSource(stream);
-    recorderNode = new AudioWorkletNode(audioContext, "recorder-processor");
+    session.mediaStreamSource =
+      session.audioContext.createMediaStreamSource(stream);
+    session.recorderNode = new AudioWorkletNode(
+      session.audioContext,
+      "recorder-processor"
+    );
 
-    recorderNode.port.onmessage = (event) => {
+    session.recorderNode.port.onmessage = (event) => {
       // event.data already IS the transferred ArrayBuffer (see
       // recorder-processor.js flushChunk), so send it directly.
       const chunk = event.data;
-      if (speechActive) {
-        sendChunk(chunk);
+      if (session.speechActive) {
+        sendChunk(session, chunk);
         return;
       }
 
       // Retain recent audio in case speech is detected slightly late.
-      preRollChunks.push(chunk);
+      session.preRollChunks.push(chunk);
 
-      if (preRollChunks.length > PRE_ROLL_CHUNKS) {
-        preRollChunks.shift();
+      if (session.preRollChunks.length > PRE_ROLL_CHUNKS) {
+        session.preRollChunks.shift();
       }
     };
 
-    mediaStreamSource.connect(recorderNode);
-    mediaStreamSource.connect(audioContext.destination);
-    recorderNode.port.postMessage("start");
+    session.mediaStreamSource.connect(session.recorderNode);
+    session.mediaStreamSource.connect(session.audioContext.destination);
+    session.recorderNode.port.postMessage("start");
 
-    window.location.hash = "recording";
+    clearCaptions(session);
+    // Announce the language pair (queued until the channel opens).
+    sendLangConfig(session);
+    updateRecordingHash();
     console.log("Windowlocation", window.location);
   } catch (e) {
-    console.error("startRecording failed, tearing down peer connection:", e);
-    await teardownPeerConnection();
+    console.error("startRecording failed, tearing down session:", e);
+    await stopRecording(tabId);
     throw e;
   }
 }
 
-async function setupPeerConnection() {
+async function setupPeerConnection(session) {
   const iceServers = RTC_CONFIG.ICE_SERVERS || [];
   const label = RTC_CONFIG.DATA_CHANNEL_LABEL || "audio";
-  peerConnection = new RTCPeerConnection({ iceServers });
-  audioChannel = peerConnection.createDataChannel(label, { ordered: true });
-  audioChannel.binaryType = "arraybuffer";
-  audioChannel.bufferedAmountLowThreshold = 1024 * 1024;
+  session.peerConnection = new RTCPeerConnection({ iceServers });
+  session.audioChannel = session.peerConnection.createDataChannel(label, {
+    ordered: true,
+  });
+  session.audioChannel.binaryType = "arraybuffer";
+  session.audioChannel.bufferedAmountLowThreshold = 1024 * 1024;
 
-  audioChannel.onopen = () => {
+  session.audioChannel.onopen = () => {
     console.log("Audio DataChannel is open now.");
-    flushPendingChunks();
+    // Control messages first so the backend knows the languages before the
+    // audio they describe starts arriving.
+    flushPendingControl(session);
+    flushPendingChunks(session);
   };
-  audioChannel.onclose = () => {
-    audioChannel = null;
+  session.audioChannel.onclose = () => {
+    session.audioChannel = null;
     console.log("Audio DataChannel is closed now.");
   };
-  audioChannel.onerror = (error) => {
+  session.audioChannel.onerror = (error) => {
     console.error("DataChannel error observed:", error);
   };
-  audioChannel.onmessage = (event) => {
-    console.log("DataChannel message received:", event.data);
+  session.audioChannel.onmessage = (event) => {
+    handleServerMessage(session, event.data);
   };
 
-  const offer = await peerConnection.createOffer();
-  await peerConnection.setLocalDescription(offer);
-  await waitForIceGatheringComplete(peerConnection);
-  const answer = await exchangeOffer(peerConnection.localDescription);
-  await peerConnection.setRemoteDescription(answer);
+  const offer = await session.peerConnection.createOffer();
+  await session.peerConnection.setLocalDescription(offer);
+  await waitForIceGatheringComplete(session.peerConnection);
+  const answer = await exchangeOffer(session.peerConnection.localDescription);
+  await session.peerConnection.setRemoteDescription(answer);
   console.log("WebRTC peer connection established.");
 }
 
@@ -230,81 +488,105 @@ async function exchangeOffer(localDescription) {
   });
 }
 
-function sendChunk(audioData) {
-  if (audioChannel && audioChannel.readyState === "open") {
-    if (pendingChunks.length) flushPendingChunks();
-    audioChannel.send(audioData);
-  } else if (audioChannel) {
-    if (pendingChunks.length >= MAX_PENDING_CHUNKS) pendingChunks.shift();
-    pendingChunks.push(audioData);
+function sendChunk(session, audioData) {
+  if (session.audioChannel && session.audioChannel.readyState === "open") {
+    if (session.pendingChunks.length) flushPendingChunks(session);
+    session.audioChannel.send(audioData);
+  } else if (session.audioChannel) {
+    if (session.pendingChunks.length >= MAX_PENDING_CHUNKS)
+      session.pendingChunks.shift();
+    session.pendingChunks.push(audioData);
   } else {
     console.error("No audio DataChannel. State: no peer connection");
   }
 }
 
-function flushPendingChunks() {
-  while (pendingChunks.length && audioChannel.readyState === "open") {
-    audioChannel.send(pendingChunks.shift());
+function flushPendingChunks(session) {
+  while (
+    session.pendingChunks.length &&
+    session.audioChannel?.readyState === "open"
+  ) {
+    session.audioChannel.send(session.pendingChunks.shift());
   }
 }
 
-async function stopRecording() {
-  if (recorderNode) {
-    recorderNode.port.postMessage("stop");
+async function stopRecording(tabId) {
+  const session = sessions.get(tabId);
+  if (!session) return;
+
+  if (session.recorderNode) {
+    session.recorderNode.port.postMessage("stop");
     // Let the worklet deliver its final flush chunk before disconnecting.
     await new Promise((r) => setTimeout(r, 100));
-    recorderNode.disconnect();
-    mediaStreamSource.disconnect();
-    audioContext.close();
-    recorderNode = null;
-    mediaStreamSource = null;
-    audioContext = null;
+    try {
+      session.recorderNode.disconnect();
+    } catch (e) {
+      console.warn("recorderNode.disconnect failed:", e);
+    }
+    try {
+      session.mediaStreamSource?.disconnect();
+    } catch (e) {
+      console.warn("mediaStreamSource.disconnect failed:", e);
+    }
+    // Nodes are per-session, but the context is shared: never close it here.
+    session.recorderNode = null;
+    session.mediaStreamSource = null;
+    session.audioContext = null;
   }
 
-  if (mediaStream) {
-    mediaStream.getTracks().forEach((t) => t.stop());
-    mediaStream = null;
+  if (session.mediaStream) {
+    session.mediaStream.getTracks().forEach((t) => t.stop());
+    session.mediaStream = null;
   }
 
-  // // Update current state in URL
-  window.location.hash = "";
-
-  if (vad) {
-    await vad.pause();
-    vad = null;
+  if (session.vad) {
+    await session.vad.pause();
+    session.vad = null;
   }
-  speechActive = false;
-  preRollChunks.length = 0;
+  session.speechActive = false;
+  session.preRollChunks.length = 0;
+  clearCaptions(session);
 
-  await teardownPeerConnection();
-  console.log("WebRTC peer connection closed on stop-recording.");
+  await teardownPeerConnection(session);
+  sessions.delete(tabId);
+  updateRecordingHash();
+  // Last session out closes the shared recorder context; otherwise it stays
+  // up for the remaining tabs.
+  await releaseSharedAudioContext();
+  console.log(`Session for tab ${tabId} stopped (${sessions.size} left).`);
 }
 
-async function teardownPeerConnection() {
-  if (audioChannel) {
+async function stopAllRecordings() {
+  for (const tabId of [...sessions.keys()]) {
+    await stopRecording(tabId);
+  }
+}
+
+async function teardownPeerConnection(session) {
+  if (session.audioChannel) {
     try {
-      if (audioChannel.readyState === "open") {
-        flushPendingChunks();
+      if (session.audioChannel.readyState === "open") {
+        flushPendingChunks(session);
         await new Promise((r) => setTimeout(r, 200));
-      } else if (pendingChunks.length) {
+      } else if (session.pendingChunks.length) {
         console.warn(
-          `Dropping ${pendingChunks.length} unsent audio chunks; DataChannel never opened.`,
+          `Dropping ${session.pendingChunks.length} unsent audio chunks; DataChannel never opened.`,
         );
       }
-      audioChannel.close();
+      session.audioChannel.close();
     } catch (e) {
       console.error("Error closing DataChannel:", e);
     }
-    audioChannel = null;
+    session.audioChannel = null;
   }
-  pendingChunks = [];
+  session.pendingChunks = [];
 
-  if (peerConnection) {
+  if (session.peerConnection) {
     try {
-      peerConnection.close();
+      session.peerConnection.close();
     } catch (e) {
       console.error("Error closing peer connection:", e);
     }
-    peerConnection = null;
+    session.peerConnection = null;
   }
 }

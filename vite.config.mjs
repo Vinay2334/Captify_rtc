@@ -34,6 +34,11 @@ function copyExtensionAssets() {
         resolve(srcDir, "recorder-processor.js"),
         resolve(outDir, "recorder-processor.js")
       );
+      // Classic script: must stay import-free for content_scripts (see above).
+      copyFileSync(
+        resolve(srcDir, "content-script.js"),
+        resolve(outDir, "content-script.js")
+      );
       const iconsDir = resolve(projectRoot, "icons");
       if (existsSync(iconsDir)) {
         cpSync(iconsDir, resolve(outDir, "icons"), { recursive: true });
@@ -94,6 +99,11 @@ export default defineConfig({
       input: {
         offscreen: "offscreen.html",
         "service-worker": "service-worker.js",
+        // NOTE: content-script.js is intentionally NOT a bundle entry.
+        // Manifest content_scripts load as classic scripts (no module
+        // support), so a bundled ESM output with `import` statements fails
+        // with "Cannot use import statement outside a module". It is copied
+        // verbatim below, like recorder-processor.js.
       },
       output: {
         // Stable, hash-free names: manifest.json references
