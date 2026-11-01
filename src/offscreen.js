@@ -179,8 +179,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             throw new Error("caption-language missing tabId");
           }
           applyLangConfig(message.tabId, {
-            source: message.source,
-            target: message.targetLang,
+            source: message.source || "en",
+            target: message.targetLang || "en",
           });
           break;
         default:

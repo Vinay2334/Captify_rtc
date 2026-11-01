@@ -422,7 +422,6 @@
         font-size: 18px;
         font-weight: 400;
         line-height: 1.45;
-        text-align: center;
         color: #ffffff;
         overflow-wrap: break-word;
         white-space: pre-wrap;
