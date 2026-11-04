@@ -168,6 +168,12 @@ chrome.action.onClicked.addListener(async (tab) => {
   }
 
   chrome.action.setIcon({ path: "/icons/recording.png", tabId: tab.id });
+
+  // Reveal the tab's overlay immediately so the subtitle box (with its
+  // buffering play button) is visible on icon click, before the backend's
+  // first transcript arrives. The session's caption-clear broadcast covers
+  // this too; this direct message covers already-injected scripts.
+  await sendToTab(tab.id, { type: "caption-show" });
 });
 
 // When a tab closes, stop only that tab's session. The shared offscreen
@@ -184,6 +190,7 @@ chrome.tabs.onRemoved.addListener(async (tabId) => {
 chrome.tabs.onUpdated.addListener(async (tabId, changeInfo) => {
   if (changeInfo.status === "complete" && recordingTabs.has(tabId)) {
     await ensureCaptionScript(tabId);
+    await sendToTab(tabId, { type: "caption-show" });
   }
 });
 
@@ -216,6 +223,24 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           });
         } catch (e) {
           console.warn("caption-language delivery failed:", e?.message || e);
+        }
+      }
+      return;
+    }
+    if (message.type === "caption-pause") {
+      // Play/pause button in the tab's status bar. Forward as an explicit
+      // pause/resume for that tab's offscreen session so pausing also stops
+      // audio streaming, not just the overlay.
+      const tabId = message.tabId ?? sender?.tab?.id;
+      if (tabId != null) {
+        try {
+          await chrome.runtime.sendMessage({
+            type: message.paused ? "pause-recording" : "resume-recording",
+            target: "offscreen",
+            tabId,
+          });
+        } catch (e) {
+          console.warn("caption-pause delivery failed:", e?.message || e);
         }
       }
       return;

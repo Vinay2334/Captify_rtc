@@ -86,8 +86,11 @@ function createSession(tabId) {
     preRollChunks: [],
     vad: null,
     speechActive: false,
-    transcriptBuffers: new Map(),
-    currentItemId: null,
+    // True while the tab's play/pause button is paused: audio chunks are
+    // dropped and VAD is paused so the backend receives nothing.
+    paused: false,
+    transcriptBuffers: new Map(), // segKey -> { rev, text }
+    currentItemId: null, // now holds the active segKey
     currentText: "",
     connectionPromise: null,
     // Language pair picked in the tab's subtitle window. Sent to the backend
@@ -102,6 +105,10 @@ function createSession(tabId) {
 // content script announces its defaults on load, which can predate
 // start-recording). Applied when the session is created.
 const pendingLangConfig = new Map();
+
+// Pause presses that arrived before their tab's session existed. Applied
+// when the session is created so an early pause still takes effect.
+const pendingPaused = new Map();
 
 function langPayload(config) {
   return JSON.stringify({
@@ -144,6 +151,53 @@ function applyLangConfig(tabId, config) {
   }
 }
 
+async function applyPaused(tabId, paused) {
+  pendingPaused.set(tabId, paused);
+  const session = sessions.get(tabId);
+  console.log(`applyPaused(${tabId}, ${paused}) session=${!!session}`);
+  if (!session) return;
+  session.paused = paused;
+  if (paused) {
+    // Drop anything already queued so resume starts from fresh audio
+    // instead of replaying stale pre-roll.
+    session.preRollChunks.length = 0;
+    session.pendingChunks.length = 0;
+    session.speechActive = false;
+    if (session.vad) {
+      try {
+        await session.vad.pause();
+      } catch (e) {
+        console.warn("VAD pause failed:", e);
+      }
+    }
+  } else {
+    if (session.vad) {
+      try {
+        await session.vad.start();
+      } catch (e) {
+        console.warn("VAD resume failed:", e);
+      }
+    }
+    // The backend can time out the RTC session while paused (no audio flows
+    // during pause). Without a reconnect here the play button spins forever:
+    // chunks queue on a dead channel and no transcripts arrive to clear the
+    // buffering state. If the transport is no longer alive, tear down the
+    // stale peer connection and start a fresh one now.
+    if (!isConnectionAlive(session)) {
+      try {
+        await ensureConnection(session);
+        // A fresh server-side session lost the previous language state.
+        sendLangConfig(session);
+      } catch (e) {
+        console.warn(
+          "RTC reconnect on resume failed, will retry on speech:",
+          e,
+        );
+      }
+    }
+  }
+}
+
 function updateRecordingHash() {
   window.location.hash = sessions.size > 0 ? "recording" : "";
 }
@@ -182,6 +236,18 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             source: message.source || "en",
             target: message.targetLang || "en",
           });
+          break;
+        case "pause-recording":
+          if (message.tabId == null) {
+            throw new Error("pause-recording missing tabId");
+          }
+          await applyPaused(message.tabId, true);
+          break;
+        case "resume-recording":
+          if (message.tabId == null) {
+            throw new Error("resume-recording missing tabId");
+          }
+          await applyPaused(message.tabId, false);
           break;
         default:
           if (message.type === "caption" || message.type === "caption-clear") {
@@ -238,27 +304,39 @@ function handleServerMessage(session, raw) {
   }
 
   if (msg.type === "transcript.delta") {
-    const prev = session.transcriptBuffers.get(msg.item_id) || "";
-    const next = prev + (msg.delta || "");
-    session.transcriptBuffers.set(msg.item_id, next);
-    session.currentItemId = msg.item_id;
+    // seg_id is the replace key; item_id stays as the upstream turn id.
+    // Missing seg_id/rev means an old backend: fall back to append.
+    const seg = msg.seg_id || msg.item_id;
+    const rev = msg.rev || 0;
+    const prev = session.transcriptBuffers.get(seg);
+    let next;
+    if (!prev || prev.rev !== rev) {
+      next = msg.delta || ""; // new window or new revision: replace
+    } else {
+      next = prev.text + (msg.delta || ""); // token piece: append
+    }
+    session.transcriptBuffers.set(seg, { rev, text: next });
+    session.currentItemId = seg;
     session.currentText = next;
     broadcastCaption(session, session.currentText, session.currentItemId, false);
   } else if (msg.type === "transcript.completed") {
+    const seg = msg.seg_id || msg.item_id;
     const transcript = msg.transcript || "";
     if (transcript) {
-      session.transcriptBuffers.set(msg.item_id, transcript);
-      session.currentItemId = msg.item_id;
+      session.transcriptBuffers.set(seg, { rev: -1, text: transcript });
+      session.currentItemId = seg;
       session.currentText = transcript;
       broadcastCaption(session, session.currentText, session.currentItemId, true);
-    } else if (msg.item_id === session.currentItemId || !transcript) {
+      session.currentItemId = null;
+      session.currentText = "";
+    } else if (seg === session.currentItemId || !transcript) {
       // Empty completion (silence/VAD artifact): hide a stale line rather
       // than flashing an empty box.
-      session.transcriptBuffers.delete(msg.item_id);
-      if (msg.item_id === session.currentItemId) {
+      session.transcriptBuffers.delete(seg);
+      if (seg === session.currentItemId) {
         session.currentItemId = null;
         session.currentText = "";
-        broadcastCaption(session, "", msg.item_id, true);
+        broadcastCaption(session, "", seg, true);
       }
     }
   } else if (msg.type === "error") {
@@ -266,6 +344,18 @@ function handleServerMessage(session, raw) {
   } else {
     console.log("DataChannel message received:", raw);
   }
+}
+
+// True only when audio can actually flow: the peer connection is connected
+// AND the DataChannel is open. Anything else (connecting, disconnected,
+// failed, closed, or torn down) means the session is no longer alive and the
+// caller must reconnect via ensureConnection (which tears down the stale
+// peer connection/channel and negotiates a fresh one).
+function isConnectionAlive(session) {
+  return (
+    session.peerConnection?.connectionState === "connected" &&
+    session.audioChannel?.readyState === "open"
+  );
 }
 
 async function ensureConnection(session) {
@@ -307,6 +397,7 @@ async function startRecording(tabId, streamId) {
   // Picks announced before this session existed (content-script defaults).
   const knownLang = pendingLangConfig.get(tabId);
   if (knownLang) session.langConfig = knownLang;
+  if (pendingPaused.get(tabId) === true) session.paused = true;
 
   // Set up the peer connection FIRST, before any audio await, mirroring how
   // the socket build opened its WebSocket first so transport failures surf
@@ -347,7 +438,12 @@ async function startRecording(tabId, streamId) {
       onnxWASMBasePath: assetBase,
       getStream: async () => stream,
       pauseStream: async () => {},
+      // Resume must reuse the tab capture stream. The library default calls
+      // getUserMedia for the microphone, which fails in the offscreen
+      // document with NotAllowedError: Permission dismissed.
+      resumeStream: async (oldStream) => oldStream ?? stream,
       onSpeechStart: async () => {
+        if (session.paused) return;
         session.speechActive = true;
         console.log("Speech detected");
         try {
@@ -366,6 +462,13 @@ async function startRecording(tabId, streamId) {
     });
 
     session.vad.start();
+    if (session.paused) {
+      try {
+        await session.vad.pause();
+      } catch (e) {
+        console.warn("VAD initial pause failed:", e);
+      }
+    }
 
     session.audioContext = await getSharedAudioContext();
 
@@ -379,6 +482,7 @@ async function startRecording(tabId, streamId) {
     session.recorderNode.port.onmessage = (event) => {
       // event.data already IS the transferred ArrayBuffer (see
       // recorder-processor.js flushChunk), so send it directly.
+      if (session.paused) return;
       const chunk = event.data;
       if (session.speechActive) {
         sendChunk(session, chunk);
@@ -490,6 +594,7 @@ async function exchangeOffer(localDescription) {
 }
 
 function sendChunk(session, audioData) {
+  if (session.paused) return;
   if (session.audioChannel && session.audioChannel.readyState === "open") {
     if (session.pendingChunks.length) flushPendingChunks(session);
     session.audioChannel.send(audioData);
@@ -513,7 +618,10 @@ function flushPendingChunks(session) {
 
 async function stopRecording(tabId) {
   const session = sessions.get(tabId);
-  if (!session) return;
+  if (!session) {
+    pendingPaused.delete(tabId);
+    return;
+  }
 
   if (session.recorderNode) {
     session.recorderNode.port.postMessage("stop");
@@ -550,6 +658,7 @@ async function stopRecording(tabId) {
 
   await teardownPeerConnection(session);
   sessions.delete(tabId);
+  pendingPaused.delete(tabId);
   updateRecordingHash();
   // Last session out closes the shared recorder context; otherwise it stays
   // up for the remaining tabs.

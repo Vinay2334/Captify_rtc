@@ -46,6 +46,12 @@
   let visible = false;
   let isClosing = false;
   let hideTimeout = null;
+  let paused = false;
+  let buffering = true;
+  let statusBar = null;
+  let playBtn = null;
+  let statusText = null;
+  let statusDot = null;
 
   // Window-level listener references so they can be cleanly removed on teardown
   let onWindowPointerDown = null;
@@ -62,6 +68,78 @@
       });
     } catch (e) {
       // Extension context gone (e.g. during unload); selection is best-effort.
+    }
+  }
+
+  const SVG_PLAY =
+    '<svg width="12" height="12" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M4 2.5v11l9-5.5z"/></svg>';
+  const SVG_PAUSE =
+    '<svg width="12" height="12" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><rect x="3" y="2.5" width="3.4" height="11" rx="1"/><rect x="9.6" y="2.5" width="3.4" height="11" rx="1"/></svg>';
+
+  function sendPauseState() {
+    if (isClosing) return;
+    try {
+      chrome.runtime.sendMessage({ type: "caption-pause", paused });
+    } catch (e) {
+      // Extension context gone; UI state still updates locally.
+    }
+  }
+
+  function updateStatusUI() {
+    if (!playBtn || !statusText || !statusDot) return;
+    const showSpinner = buffering && !paused;
+    playBtn.classList.toggle("is-buffering", showSpinner);
+    playBtn.classList.toggle("is-paused", paused);
+    if (showSpinner) {
+      playBtn.innerHTML = '<span class="captify-spinner" aria-hidden="true"></span>';
+      playBtn.title = "Waiting for subtitles";
+      playBtn.setAttribute("aria-label", "Waiting for subtitles");
+    } else if (paused) {
+      playBtn.innerHTML = SVG_PLAY;
+      playBtn.title = "Resume subtitles";
+      playBtn.setAttribute("aria-label", "Resume subtitles");
+    } else {
+      playBtn.innerHTML = SVG_PAUSE;
+      playBtn.title = "Pause subtitles";
+      playBtn.setAttribute("aria-label", "Pause subtitles");
+    }
+    statusDot.classList.toggle("is-live", !paused && !buffering);
+    statusDot.classList.toggle("is-paused", paused);
+    if (paused) {
+      statusText.textContent = "Paused";
+    } else if (buffering) {
+      statusText.textContent = "Waiting for subtitles\u2026";
+    } else {
+      statusText.textContent = "Live";
+    }
+  }
+
+  function setPaused(next) {
+    if (isClosing) return;
+    paused = next;
+    if (!paused) {
+      // Resuming re-enters the waiting state until the backend's next
+      // subtitle arrives; the button spins meanwhile.
+      buffering = true;
+    }
+    updateStatusUI();
+    sendPauseState();
+  }
+
+  // Reveal the panel for an active recording (icon click, re-inject after
+  // navigation, or the session's initial caption-clear). Plain page loads
+  // stay hidden: they never receive these events.
+  function revealForRecording() {
+    if (isClosing) return;
+    ensureOverlay();
+    clearTimeout(hideTimeout);
+    if (!visible) {
+      visible = true;
+      requestAnimationFrame(() => {
+        container?.classList.add("is-visible");
+      });
+    } else {
+      container?.classList.add("is-visible");
     }
   }
 
@@ -474,6 +552,112 @@
       .resize-handle:hover {
         color: rgba(255, 255, 255, 0.75);
       }
+
+      /* Bottom status bar: play/pause button on the left, status text right */
+      .captify-statusbar {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        padding: 8px 14px;
+        border-top: 1px solid rgba(255, 255, 255, 0.1);
+        background: rgba(255, 255, 255, 0.04);
+        flex-shrink: 0;
+      }
+
+      .captify-play-btn {
+        width: 26px;
+        height: 26px;
+        border-radius: 8px;
+        border: 1px solid rgba(255, 255, 255, 0.12);
+        background: rgba(255, 255, 255, 0.07);
+        color: #f3f4f6;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        cursor: pointer;
+        flex-shrink: 0;
+        padding: 0;
+        outline: none;
+        transition: background 0.15s ease, border-color 0.15s ease, transform 0.1s ease;
+      }
+
+      .captify-play-btn:hover {
+        background: rgba(255, 255, 255, 0.14);
+        border-color: rgba(255, 255, 255, 0.25);
+      }
+
+      .captify-play-btn:active {
+        transform: scale(0.93);
+      }
+
+      .captify-play-btn:focus-visible {
+        border-color: rgba(255, 255, 255, 0.6);
+        box-shadow: 0 0 0 2px rgba(255, 255, 255, 0.2);
+      }
+
+      .captify-spinner {
+        width: 13px;
+        height: 13px;
+        border-radius: 50%;
+        border: 2px solid rgba(255, 255, 255, 0.25);
+        border-top-color: #fff;
+        animation: captify-spin 0.8s linear infinite;
+        display: inline-block;
+      }
+
+      @keyframes captify-spin {
+        to { transform: rotate(360deg); }
+      }
+
+      .captify-status {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        flex: 1;
+        min-width: 0;
+        font-size: 12px;
+        font-weight: 500;
+        letter-spacing: 0.01em;
+        color: rgba(255, 255, 255, 0.75);
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+
+      .status-dot {
+        width: 7px;
+        height: 7px;
+        border-radius: 50%;
+        background: #f5a623;
+        flex-shrink: 0;
+        animation: captify-pulse 1.6s ease-in-out infinite;
+      }
+
+      .status-dot.is-live {
+        background: #34d399;
+        animation: none;
+      }
+
+      .status-dot.is-paused {
+        background: rgba(255, 255, 255, 0.35);
+        animation: none;
+      }
+
+      @keyframes captify-pulse {
+        0%, 100% { opacity: 1; }
+        50% { opacity: 0.35; }
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        .captify-spinner,
+        .status-dot {
+          animation: none;
+        }
+        .captify-panel,
+        .caption-line {
+          transition: none;
+        }
+      }
     `;
     return style;
   }
@@ -663,8 +847,14 @@
       headerWrap = null;
       header = null;
       body = null;
+      statusBar = null;
+      playBtn = null;
+      statusText = null;
+      statusDot = null;
       currentLine = null;
       currentItemId = null;
+      paused = false;
+      buffering = true;
       // Allow re-injection when the user clicks the extension icon again
       window.__captifyCaptionInjected = false;
     }, 280);
@@ -731,6 +921,33 @@
     body = document.createElement("div");
     body.className = "captify-body";
     container.appendChild(body);
+
+    // Bottom status bar: play/pause button on the left, live status on right.
+    statusBar = document.createElement("div");
+    statusBar.className = "captify-statusbar";
+
+    playBtn = document.createElement("button");
+    playBtn.type = "button";
+    playBtn.className = "captify-play-btn";
+    playBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      setPaused(!paused);
+    });
+
+    const statusWrap = document.createElement("div");
+    statusWrap.className = "captify-status";
+    statusDot = document.createElement("span");
+    statusDot.className = "status-dot";
+    statusDot.setAttribute("aria-hidden", "true");
+    statusText = document.createElement("span");
+    statusText.textContent = "Waiting for subtitles\u2026";
+    statusWrap.appendChild(statusDot);
+    statusWrap.appendChild(statusText);
+
+    statusBar.appendChild(playBtn);
+    statusBar.appendChild(statusWrap);
+    container.appendChild(statusBar);
+    updateStatusUI();
 
     const resizeHandle = document.createElement("div");
     resizeHandle.className = "resize-handle";
@@ -941,7 +1158,7 @@
   }
 
   function show(text, itemId, final) {
-    if (isClosing) return;
+    if (isClosing || paused) return;
     ensureOverlay();
     clearTimeout(hideTimeout);
 
@@ -950,6 +1167,13 @@
       requestAnimationFrame(() => {
         container?.classList.add("is-visible");
       });
+    }
+
+    // First backend subtitle ends the waiting state: stop the button
+    // spinner and flip the status bar to Live.
+    if (buffering) {
+      buffering = false;
+      updateStatusUI();
     }
 
     if (!currentLine || (itemId != null && currentItemId !== itemId)) {
@@ -979,6 +1203,7 @@
   function onRuntimeMessage(message) {
     if (isClosing) return;
     if (message?.type === "caption") {
+      if (paused) return;
       const text = (message.text || "").trim();
       if (!text) {
         if (
@@ -998,6 +1223,18 @@
       if (body) body.innerHTML = "";
       currentLine = null;
       currentItemId = null;
+      // A new session starts waiting for backend subtitles: reveal the
+      // overlay immediately (icon click) and spin the play button.
+      revealForRecording();
+      if (!paused && !buffering) {
+        buffering = true;
+        updateStatusUI();
+      } else {
+        updateStatusUI();
+      }
+    } else if (message?.type === "caption-show") {
+      revealForRecording();
+      updateStatusUI();
     } else if(message?.type === "caption-teardown") {
       closeAndTeardown(false);
     }
