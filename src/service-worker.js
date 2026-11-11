@@ -122,24 +122,21 @@ async function stopTabRecording(tabId) {
   await maybeCloseOffscreen();
 }
 
-chrome.action.onClicked.addListener(async (tab) => {
-  if (tab?.id == null) return;
-  await reconcileRecordingTabs();
-  // Toggle recording for the clicked tab only; other tabs keep recording.
-  if (recordingTabs.has(tab.id)) {
-    await stopTabRecording(tab.id);
-    return;
-  }
-
+// Start (or restart) captioning for one tab: capture, offscreen session,
+// overlay reveal. Shared by the toolbar toggle and the overlay's Retry
+// button (which fires after a terminal connection error tore the session
+// down). Throws on synchronous failures (e.g. tabCapture denied); backend
+// connectivity failures surface later via caption-status from offscreen.
+async function startTabRecording(tabId) {
   await ensureOffscreen();
 
-  // Get a MediaStream for the clicked tab.
+  // Get a MediaStream for the tab.
   const streamId = await chrome.tabCapture.getMediaStreamId({
-    targetTabId: tab.id,
+    targetTabId: tabId,
   });
 
-  recordingTabs.add(tab.id);
-  await ensureCaptionScript(tab.id);
+  recordingTabs.add(tabId);
+  await ensureCaptionScript(tabId);
 
   // Send the stream ID to the offscreen document to start this tab's
   // session. The offscreen document may not have registered its onMessage
@@ -148,7 +145,7 @@ chrome.action.onClicked.addListener(async (tab) => {
   const message = {
     type: "start-recording",
     target: "offscreen",
-    tabId: tab.id,
+    tabId,
     data: streamId,
   };
   try {
@@ -162,18 +159,30 @@ chrome.action.onClicked.addListener(async (tab) => {
       }
     }
   } catch (e) {
-    recordingTabs.delete(tab.id);
+    recordingTabs.delete(tabId);
     await maybeCloseOffscreen();
     throw e;
   }
 
-  chrome.action.setIcon({ path: "/icons/recording.png", tabId: tab.id });
+  chrome.action.setIcon({ path: "/icons/recording.png", tabId });
 
   // Reveal the tab's overlay immediately so the subtitle box (with its
   // buffering play button) is visible on icon click, before the backend's
   // first transcript arrives. The session's caption-clear broadcast covers
   // this too; this direct message covers already-injected scripts.
-  await sendToTab(tab.id, { type: "caption-show" });
+  await sendToTab(tabId, { type: "caption-show" });
+}
+
+chrome.action.onClicked.addListener(async (tab) => {
+  if (tab?.id == null) return;
+  await reconcileRecordingTabs();
+  // Toggle recording for the clicked tab only; other tabs keep recording.
+  if (recordingTabs.has(tab.id)) {
+    await stopTabRecording(tab.id);
+    return;
+  }
+
+  await startTabRecording(tab.id);
 });
 
 // When a tab closes, stop only that tab's session. The shared offscreen
@@ -208,6 +217,59 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       sendResponse?.({ ok: true });
       return;
     }
+    if (message.type === "caption-retry") {
+      // Retry button in the tab overlay's error state. A live session
+      // (mid-session drop) just reconnects; a torn-down session (startup
+      // failure) needs a full restart with a fresh capture stream.
+      const tabId = message.tabId ?? sender?.tab?.id;
+      if (tabId != null) {
+        await reconcileRecordingTabs();
+        if (recordingTabs.has(tabId)) {
+          try {
+            await chrome.runtime.sendMessage({
+              type: "retry-connection",
+              target: "offscreen",
+              tabId,
+            });
+          } catch (e) {
+            console.warn("retry-connection delivery failed:", e?.message || e);
+          }
+        } else {
+          try {
+            await startTabRecording(tabId);
+          } catch (e) {
+            console.warn("retry restart failed:", e?.message || e);
+            await sendToTab(tabId, {
+              type: "caption-status",
+              tabId,
+              status: "error",
+              message:
+                "Couldn't restart captions. Check that the backend is running, then retry.",
+            });
+          }
+        }
+      }
+      return;
+    }
+    if (message.type === "session-failed") {
+      // Offscreen gave up connecting (retries exhausted) and tore the
+      // session down. Drop the tab WITHOUT tearing down its overlay (unlike
+      // stopTabRecording): the overlay must stay up showing the error +
+      // Retry button from the caption-status broadcast that precedes this.
+      const tabId = message.tabId;
+      if (tabId != null) recordingTabs.delete(tabId);
+      try {
+        await chrome.action.setIcon({
+          path: "icons/not-recording.png",
+          tabId,
+        });
+      } catch (e) {
+        // Tab may already be gone.
+      }
+      await maybeCloseOffscreen();
+      sendResponse?.({ ok: true });
+      return;
+    }
     if (message.type === "caption-language") {
       // Dropdown picks from a tab's subtitle window. The content script has
       // no tabId of its own, so identify the tab from the message sender.
@@ -218,7 +280,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             type: "caption-language",
             target: "offscreen",
             tabId,
-            source: message.source,
+            mode: message.mode,
             targetLang: message.target,
           });
         } catch (e) {
@@ -252,7 +314,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         url: url,
         filename: "recording.webm", // Specify the filename for the download
       });
-    } else if (message.type === "caption" || message.type === "caption-clear") {
+    } else if (
+      message.type === "caption" ||
+      message.type === "caption-clear" ||
+      message.type === "caption-status"
+    ) {
       // Live transcript from one tab's session in the offscreen document:
       // relay to that tab's caption overlay. Not awaited by the sender
       // (best-effort). Messages without a tabId (old offscreen builds) fall

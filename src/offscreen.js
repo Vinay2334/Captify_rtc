@@ -14,6 +14,12 @@
 // session because it re-registers its worklet processor on every start.
 
 import { RTC_CONFIG } from "./rtc-config.js";
+import {
+  CHANNEL_OPEN_TIMEOUT_MS,
+  MAX_CONNECT_ATTEMPTS,
+  SIGNAL_TIMEOUT_MS,
+  computeRetryDelay,
+} from "./retry-policy.mjs";
 import { MicVAD } from "@ricky0123/vad-web";
 
 // Chunks produced before the DataChannel opens are queued, then flushed on
@@ -93,12 +99,58 @@ function createSession(tabId) {
     currentItemId: null, // now holds the active segKey
     currentText: "",
     connectionPromise: null,
-    // Language pair picked in the tab's subtitle window. Sent to the backend
+    // Mode/target picked in the tab's subtitle window. Sent to the backend
     // over the DataChannel (see sendLangConfig).
     langConfig: null,
     // Control payloads queued while the DataChannel is not open yet.
     pendingControl: [],
+    // Connection lifecycle for the overlay's error/retry UI. While
+    // "connecting"/"reconnecting" the tab shows a spinner; only a terminal
+    // "error" (retries exhausted) shows the error message + Retry button.
+    // Never stuck buffering silently: every terminal failure is broadcast.
+    connectionStatus: "idle",
+    connectAttempt: 0,
+    reconnectTimer: null,
+    // Set while stopRecording runs so channel/peer "closed" callbacks from
+    // the intentional teardown don't trigger a background reconnect.
+    stopping: false,
+    // Last terminal connection error, for the startRecording failure path
+    // (which re-broadcasts the error after stopRecording's caption-clear).
+    lastConnectError: null,
   };
+}
+
+// A session is gone (stopped or never created): only log, never throw, so a
+// stray timer or message can't crash the document.
+function getLiveSession(session) {
+  return session && !session.stopping && sessions.get(session.tabId) === session
+    ? session
+    : null;
+}
+
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+// Broadcast one connection-state step to the tab overlay (via the service
+// worker, which forwards caption-status to the tab like captions). Best
+// effort: the service worker may be restarting; the tab's watchdog covers a
+// lost message (see content-script.js).
+function notifyConnectionStatus(session, status, detail = {}) {
+  session.connectionStatus = status;
+  try {
+    chrome.runtime.sendMessage({
+      type: "caption-status",
+      target: "captions",
+      tabId: session.tabId,
+      status,
+      attempt: session.connectAttempt,
+      maxAttempts: MAX_CONNECT_ATTEMPTS,
+      message: detail.message || null,
+    });
+  } catch (e) {
+    console.warn("Failed to broadcast caption-status:", e);
+  }
 }
 
 // Language picks that arrived before their tab's session existed (the
@@ -111,11 +163,16 @@ const pendingLangConfig = new Map();
 const pendingPaused = new Map();
 
 function langPayload(config) {
-  return JSON.stringify({
+  // Source language is never sent: the backend model auto-detects it.
+  // Target is only meaningful (and only sent) in translation mode.
+  const payload = {
     type: "language-config",
-    source_lang: config.source,
-    target_lang: config.target,
-  });
+    mode: config.mode || "translation",
+  };
+  if (payload.mode === "translation") {
+    payload.target_lang = config.target || "en";
+  }
+  return JSON.stringify(payload);
 }
 
 function flushPendingControl(session) {
@@ -184,16 +241,14 @@ async function applyPaused(tabId, paused) {
     // buffering state. If the transport is no longer alive, tear down the
     // stale peer connection and start a fresh one now.
     if (!isConnectionAlive(session)) {
-      try {
-        await ensureConnection(session);
-        // A fresh server-side session lost the previous language state.
-        sendLangConfig(session);
-      } catch (e) {
-        console.warn(
-          "RTC reconnect on resume failed, will retry on speech:",
-          e,
-        );
-      }
+      // ensureConnection broadcasts connecting/reconnecting/error itself;
+      // on terminal failure the overlay shows Retry and speech retriggers.
+      const ok = await ensureConnection(session).catch((e) => {
+        console.warn("RTC reconnect on resume failed:", e);
+        return false;
+      });
+      // A fresh server-side session lost the previous language state.
+      if (ok) sendLangConfig(session);
     }
   }
 }
@@ -233,7 +288,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             throw new Error("caption-language missing tabId");
           }
           applyLangConfig(message.tabId, {
-            source: message.source || "en",
+            mode: message.mode || "translation",
             target: message.targetLang || "en",
           });
           break;
@@ -248,6 +303,16 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             throw new Error("resume-recording missing tabId");
           }
           await applyPaused(message.tabId, false);
+          break;
+        case "retry-connection":
+          // Manual Retry from the tab overlay's error state. Resets the
+          // attempt budget and runs one fresh reconnect sequence in the
+          // background; progress and the terminal outcome are broadcast as
+          // caption-status like every other connection step.
+          if (message.tabId == null) {
+            throw new Error("retry-connection missing tabId");
+          }
+          await retryConnection(message.tabId);
           break;
         default:
           if (message.type === "caption" || message.type === "caption-clear") {
@@ -340,7 +405,15 @@ function handleServerMessage(session, raw) {
       }
     }
   } else if (msg.type === "error") {
+    // Server-side failure (e.g. backend transcription error): surface it in
+    // the overlay instead of only logging. The transport itself is still up,
+    // so the session keeps running — the overlay shows the message with a
+    // Retry button that re-establishes the session server-side.
     console.warn("Transcription server error:", msg.code, msg.message);
+    notifyConnectionStatus(session, "error", {
+      message:
+        msg.message || `Transcription failed${msg.code ? ` (${msg.code})` : ""}.`,
+    });
   } else {
     console.log("DataChannel message received:", raw);
   }
@@ -358,12 +431,24 @@ function isConnectionAlive(session) {
   );
 }
 
+// One raw connect attempt: drop the stale transport, negotiate a fresh one.
+async function connectOnce(session) {
+  await teardownPeerConnection(session);
+  await setupPeerConnection(session);
+}
+
+// Connect with bounded retries and exponential backoff, broadcasting every
+// step so the tab overlay never sits on "Waiting for subtitles" while the
+// backend is down: "connecting" on the first attempt, "reconnecting" while
+// retrying, "connected" on success, and a terminal "error" once the budget
+// (see retry-policy.mjs) is exhausted. Resolves true on success, false on
+// terminal failure; concurrent callers collapse onto the in-flight sequence.
 async function ensureConnection(session) {
-  if (
-    session.peerConnection?.connectionState === "connected" &&
-    session.audioChannel?.readyState === "open"
-  ) {
-    return;
+  if (isConnectionAlive(session)) {
+    if (session.connectionStatus !== "connected") {
+      notifyConnectionStatus(session, "connected");
+    }
+    return true;
   }
 
   if (session.connectionPromise) {
@@ -371,15 +456,107 @@ async function ensureConnection(session) {
   }
 
   session.connectionPromise = (async () => {
-    await teardownPeerConnection(session);
-    await setupPeerConnection(session);
+    for (let attempt = 1; attempt <= MAX_CONNECT_ATTEMPTS; attempt++) {
+      if (!getLiveSession(session)) return false;
+      session.connectAttempt = attempt;
+      notifyConnectionStatus(
+        session,
+        attempt === 1 ? "connecting" : "reconnecting",
+      );
+      try {
+        await connectOnce(session);
+        if (!getLiveSession(session)) return false;
+        session.connectAttempt = 0;
+        notifyConnectionStatus(session, "connected");
+        return true;
+      } catch (e) {
+        console.warn(
+          `Connection attempt ${attempt}/${MAX_CONNECT_ATTEMPTS} for tab ${session.tabId} failed:`,
+          e?.message || e,
+        );
+        if (attempt >= MAX_CONNECT_ATTEMPTS) {
+          if (!getLiveSession(session)) return false;
+          session.lastConnectError = e;
+          notifyConnectionStatus(session, "error", {
+            message: friendlyConnectError(e),
+          });
+          return false;
+        }
+        await sleep(computeRetryDelay(attempt));
+      }
+    }
+    return false;
   })();
 
   try {
-    await session.connectionPromise;
+    return await session.connectionPromise;
   } finally {
     session.connectionPromise = null;
   }
+}
+
+// Short, actionable overlay text for a terminal connection failure.
+function friendlyConnectError(e) {
+  const detail = e?.message || String(e || "");
+  if (/failed to fetch|networkerror|load failed/i.test(detail)) {
+    return "Couldn't reach the transcription server. Check that the backend is running, then retry.";
+  }
+  if (/signaling failed/i.test(detail)) {
+    return `Transcription server refused the connection (${detail}). Retry, or restart the backend.`;
+  }
+  return "Connection to the transcription server failed. Retry when the backend is back.";
+}
+
+// A dropped mid-session transport (peer "failed", channel closed) heals
+// itself in the background without tearing down the audio chain: chunks
+// queue (bounded) while reconnecting and flush on "open". Terminal failure
+// leaves the session up so the overlay's Retry button can reconnect.
+function scheduleReconnect(session) {
+  const live = getLiveSession(session);
+  if (!live || session.connectionPromise || session.reconnectTimer) return;
+  if (isConnectionAlive(session)) return;
+  session.reconnectTimer = setTimeout(() => {
+    session.reconnectTimer = null;
+    const current = getLiveSession(session);
+    if (!current || isConnectionAlive(current)) return;
+    (async () => {
+      const ok = await ensureConnection(current);
+      if (ok) {
+        // A fresh server-side session lost the previous language state.
+        sendLangConfig(current);
+      }
+    })().catch((e) => {
+      console.warn("Background reconnect failed:", e?.message || e);
+    });
+  }, 500);
+}
+
+// Manual Retry from the overlay: fresh attempt budget, then one reconnect
+// sequence. Unknown tab (session already torn down) still answers with an
+// error status so the overlay never hangs waiting.
+async function retryConnection(tabId) {
+  const session = sessions.get(tabId);
+  if (!session || session.stopping) {
+    try {
+      chrome.runtime.sendMessage({
+        type: "caption-status",
+        target: "captions",
+        tabId,
+        status: "error",
+        attempt: MAX_CONNECT_ATTEMPTS,
+        maxAttempts: MAX_CONNECT_ATTEMPTS,
+        message:
+          "Session already stopped. Close this panel and start captions again from the toolbar.",
+      });
+    } catch (e) {
+      console.warn("Failed to broadcast caption-status:", e);
+    }
+    return;
+  }
+  if (session.connectionPromise) return;
+  session.connectAttempt = 0;
+  const ok = await ensureConnection(session);
+  if (ok) sendLangConfig(session);
 }
 
 async function startRecording(tabId, streamId) {
@@ -403,7 +580,27 @@ async function startRecording(tabId, streamId) {
   // the socket build opened its WebSocket first so transport failures surf
   // even if getUserMedia/audio setup below throws.
   try {
-    await ensureConnection(session);
+    const connected = await ensureConnection(session);
+    if (!connected) {
+      // Retries exhausted (e.g. backend down): don't leave the tab spinning
+      // on "Waiting for subtitles". stopRecording's caption-clear would
+      // reset the overlay to buffering, so re-broadcast the terminal error
+      // AFTER it, then tell the service worker to drop the tab (without
+      // overlay teardown — the error + Retry button must stay visible).
+      // The overlay's Retry button starts a fresh session via the toolbar
+      // flow. The throw keeps the existing failure logging contract.
+      const err = session.lastConnectError || new Error("Connection failed.");
+      await stopRecording(tabId);
+      notifyConnectionStatus(session, "error", {
+        message: friendlyConnectError(err),
+      });
+      try {
+        await chrome.runtime.sendMessage({ type: "session-failed", tabId });
+      } catch (e) {
+        console.warn("session-failed delivery failed:", e);
+      }
+      throw err;
+    }
 
     const stream = await navigator.mediaDevices.getUserMedia({
       audio: {
@@ -446,13 +643,15 @@ async function startRecording(tabId, streamId) {
         if (session.paused) return;
         session.speechActive = true;
         console.log("Speech detected");
-        try {
-          await ensureConnection(session);
-          while (session.preRollChunks.length > 0) {
-            sendChunk(session, session.preRollChunks.shift());
-          }
-        } catch (error) {
+        // Terminal failure is already shown in the overlay with Retry; skip
+        // the pre-roll flush then (no transport to flush to).
+        const ok = await ensureConnection(session).catch((error) => {
           console.error("Failed to reconnect on speech:", error);
+          return false;
+        });
+        if (!ok) return;
+        while (session.preRollChunks.length > 0) {
+          sendChunk(session, session.preRollChunks.shift());
         }
       },
       onSpeechEnd() {
@@ -502,7 +701,7 @@ async function startRecording(tabId, streamId) {
     session.recorderNode.port.postMessage("start");
 
     clearCaptions(session);
-    // Announce the language pair (queued until the channel opens).
+    // Announce the mode/target (queued until the channel opens).
     sendLangConfig(session);
     updateRecordingHash();
     console.log("Windowlocation", window.location);
@@ -529,16 +728,32 @@ async function setupPeerConnection(session) {
     // audio they describe starts arriving.
     flushPendingControl(session);
     flushPendingChunks(session);
+    const live = getLiveSession(session);
+    if (live) {
+      live.connectAttempt = 0;
+      notifyConnectionStatus(live, "connected");
+    }
   };
   session.audioChannel.onclose = () => {
     session.audioChannel = null;
     console.log("Audio DataChannel is closed now.");
+    // A mid-session close (backend restart, network drop) heals itself in
+    // the background; the overlay shows "reconnecting" until it lands.
+    // Intentional stops and in-flight retries are ignored inside.
+    scheduleReconnect(session);
   };
   session.audioChannel.onerror = (error) => {
     console.error("DataChannel error observed:", error);
   };
   session.audioChannel.onmessage = (event) => {
     handleServerMessage(session, event.data);
+  };
+  session.peerConnection.onconnectionstatechange = () => {
+    const state = session.peerConnection?.connectionState;
+    console.log(`Peer connection state for tab ${session.tabId}:`, state);
+    if (state === "failed" || state === "disconnected" || state === "closed") {
+      scheduleReconnect(session);
+    }
   };
 
   const offer = await session.peerConnection.createOffer();
@@ -547,6 +762,57 @@ async function setupPeerConnection(session) {
   const answer = await exchangeOffer(session.peerConnection.localDescription);
   await session.peerConnection.setRemoteDescription(answer);
   console.log("WebRTC peer connection established.");
+  // Signaling can succeed while the channel itself never opens; without this
+  // wait the attempt would resolve and the overlay would stick on
+  // "connecting" with no transport. Timeout counts as a failed attempt.
+  await waitForChannelOpen(session.audioChannel);
+}
+
+// Resolves when the channel opens, rejects if it closes/errors first or the
+// open takes longer than CHANNEL_OPEN_TIMEOUT_MS. Wraps (never replaces)
+// the session handlers attached by setupPeerConnection, so flush/notify on
+// open and reconnect-on-close keep working whichever settles first.
+function waitForChannelOpen(channel) {
+  if (!channel) return Promise.reject(new Error("No audio DataChannel."));
+  if (channel.readyState === "open") return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    const prevOpen = channel.onopen;
+    const prevClose = channel.onclose;
+    const prevError = channel.onerror;
+    const timer = setTimeout(() => {
+      reject(
+        new Error(
+          `DataChannel did not open within ${CHANNEL_OPEN_TIMEOUT_MS} ms.`
+        )
+      );
+    }, CHANNEL_OPEN_TIMEOUT_MS);
+    channel.onopen = (event) => {
+      clearTimeout(timer);
+      try {
+        prevOpen?.call(channel, event);
+      } finally {
+        resolve();
+      }
+    };
+    channel.onclose = (event) => {
+      clearTimeout(timer);
+      try {
+        prevClose?.call(channel, event);
+      } finally {
+        reject(new Error("DataChannel closed before opening."));
+      }
+    };
+    channel.onerror = (event) => {
+      clearTimeout(timer);
+      try {
+        prevError?.call(channel, event);
+      } finally {
+        reject(
+          event instanceof Error ? event : new Error("DataChannel error.")
+        );
+      }
+    };
+  });
 }
 
 function waitForIceGatheringComplete(pc) {
@@ -574,6 +840,8 @@ async function exchangeOffer(localDescription) {
     signalUrl,
     localDescription,
   );
+  // A hung backend must fail this attempt fast (into the retry loop), not
+  // hang one attempt forever while the overlay spins.
   const res = await fetch(signalUrl, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -581,6 +849,7 @@ async function exchangeOffer(localDescription) {
       sdp: localDescription.sdp,
       type: localDescription.type,
     }),
+    signal: AbortSignal.timeout(SIGNAL_TIMEOUT_MS),
   });
   if (!res.ok) {
     throw new Error(`Signaling failed: ${res.status} ${res.statusText}`);
@@ -602,6 +871,9 @@ function sendChunk(session, audioData) {
     if (session.pendingChunks.length >= MAX_PENDING_CHUNKS)
       session.pendingChunks.shift();
     session.pendingChunks.push(audioData);
+  } else if (session.connectionStatus === "error") {
+    // Terminal failure already shown in the overlay with a Retry button;
+    // drop quietly instead of logging per chunk (5/s) until reconnect.
   } else {
     console.error("No audio DataChannel. State: no peer connection");
   }
@@ -621,6 +893,12 @@ async function stopRecording(tabId) {
   if (!session) {
     pendingPaused.delete(tabId);
     return;
+  }
+  // Intentional stop: suppress reconnect triggers from the teardown below.
+  session.stopping = true;
+  if (session.reconnectTimer) {
+    clearTimeout(session.reconnectTimer);
+    session.reconnectTimer = null;
   }
 
   if (session.recorderNode) {

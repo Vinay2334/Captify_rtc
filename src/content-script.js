@@ -32,6 +32,11 @@
     ["fa", "Persian"],
   ];
 
+  const MODES = [
+    ["translation", "Translation"],
+    ["transcription", "Transcription"],
+  ];
+
   let host = null;
   let shadow = null;
   let container = null;
@@ -39,7 +44,7 @@
   let header = null;
   let body = null;
   let resizeObserver = null;
-  let sourceDropdown = null;
+  let modeDropdown = null;
   let targetDropdown = null;
   let currentLine = null;
   let currentItemId = null;
@@ -50,21 +55,46 @@
   let buffering = true;
   let statusBar = null;
   let playBtn = null;
+  let retryBtn = null;
   let statusText = null;
   let statusDot = null;
+  // Transport health reported by the offscreen document ("connecting" /
+  // "reconnecting" / "connected" / "error" via caption-status). While the
+  // backend is down the overlay must show an error with Retry — never spin
+  // on "Waiting for subtitles" forever.
+  let connStatus = "unknown";
+  let connMessage = null;
+  let connAttempt = null;
+  let connMaxAttempts = null;
+  // Mirrors CONNECT_WATCHDOG_MS in src/retry-policy.mjs (this is a classic
+  // script and cannot import ESM): a session that never reports back within
+  // this long is shown as an error even if no explicit status arrived.
+  const CONNECT_WATCHDOG_MS = 20000;
+  let watchdogTimer = null;
 
   // Window-level listener references so they can be cleanly removed on teardown
   let onWindowPointerDown = null;
   let onWindowPointerMove = null;
   let onWindowPointerUp = null;
 
-  function sendLanguage() {
-    if (!sourceDropdown || !targetDropdown || isClosing) return;
+  // Target only applies to translation; transcription lets the
+  // backend auto-detect the spoken language, so no target is sent.
+  function updateTargetVisibility() {
+    if (!modeDropdown || !targetDropdown) return;
+    const isTranslation = modeDropdown.getValue() === "translation";
+    targetDropdown.el.style.display = isTranslation ? "" : "none";
+    if (!isTranslation) targetDropdown.close();
+  }
+
+  function sendConfig() {
+    if (!modeDropdown || !targetDropdown || isClosing) return;
+    updateTargetVisibility();
+    const mode = modeDropdown.getValue();
     try {
       chrome.runtime.sendMessage({
         type: "caption-language",
-        source: sourceDropdown.getValue(),
-        target: targetDropdown.getValue(),
+        mode,
+        target: mode === "translation" ? targetDropdown.getValue() : null,
       });
     } catch (e) {
       // Extension context gone (e.g. during unload); selection is best-effort.
@@ -87,7 +117,12 @@
 
   function updateStatusUI() {
     if (!playBtn || !statusText || !statusDot) return;
-    const showSpinner = buffering && !paused;
+    const isError = connStatus === "error";
+    // Error state replaces the play button with Retry; every other state
+    // keeps the play/pause button.
+    if (retryBtn) retryBtn.hidden = !isError;
+    playBtn.hidden = isError;
+    const showSpinner = buffering && !paused && !isError;
     playBtn.classList.toggle("is-buffering", showSpinner);
     playBtn.classList.toggle("is-paused", paused);
     if (showSpinner) {
@@ -103,14 +138,108 @@
       playBtn.title = "Pause subtitles";
       playBtn.setAttribute("aria-label", "Pause subtitles");
     }
-    statusDot.classList.toggle("is-live", !paused && !buffering);
-    statusDot.classList.toggle("is-paused", paused);
-    if (paused) {
+    statusDot.classList.toggle("is-live", !paused && !buffering && !isError);
+    statusDot.classList.toggle("is-paused", paused && !isError);
+    statusDot.classList.toggle("is-error", isError);
+    if (isError) {
+      statusText.textContent =
+        connMessage || "Connection failed. Check the backend and retry.";
+      statusText.title = statusText.textContent;
+    } else if (paused) {
       statusText.textContent = "Paused";
+      statusText.removeAttribute("title");
     } else if (buffering) {
-      statusText.textContent = "Waiting for subtitles\u2026";
+      if (
+        (connStatus === "reconnecting" || connStatus === "connecting") &&
+        connAttempt != null &&
+        connMaxAttempts != null
+      ) {
+        statusText.textContent =
+          connStatus === "reconnecting"
+            ? `Reconnecting\u2026`
+            : `Connecting\u2026`;
+      } else if (connStatus === "reconnecting") {
+        statusText.textContent = "Reconnecting\u2026";
+      } else {
+        statusText.textContent = "Waiting for subtitles\u2026";
+      }
+      statusText.removeAttribute("title");
     } else {
       statusText.textContent = "Live";
+      statusText.removeAttribute("title");
+    }
+  }
+
+  function clearWatchdog() {
+    if (watchdogTimer) {
+      clearTimeout(watchdogTimer);
+      watchdogTimer = null;
+    }
+  }
+
+  // Backup for a session that never reports back (e.g. the status message
+  // was lost while the service worker restarted): don't buffer forever.
+  // Each caption-status or first caption disarms or restarts this; only
+  // total silence within the budget shows the error.
+  function armWatchdog() {
+    clearWatchdog();
+    watchdogTimer = setTimeout(() => {
+      watchdogTimer = null;
+      if (isClosing || !buffering) return;
+      if (connStatus === "connected" || connStatus === "error") return;
+      connStatus = "error";
+      connMessage =
+        "Couldn't reach the transcription server. Check that the backend is running, then retry.";
+      connAttempt = null;
+      connMaxAttempts = null;
+      buffering = false;
+      updateStatusUI();
+    }, CONNECT_WATCHDOG_MS);
+  }
+
+  function handleConnectionStatus(message) {
+    if (isClosing) return;
+    const status = message?.status;
+    if (status === "connected") {
+      connStatus = "connected";
+      connMessage = null;
+      connAttempt = null;
+      connMaxAttempts = null;
+      clearWatchdog();
+      updateStatusUI();
+    } else if (status === "connecting" || status === "reconnecting") {
+      connStatus = status;
+      connMessage = null;
+      connAttempt = message?.attempt ?? null;
+      connMaxAttempts = message?.maxAttempts ?? null;
+      if (!paused) buffering = true;
+      // Transport is alive enough to report: keep waiting, don't error.
+      armWatchdog();
+      updateStatusUI();
+    } else if (status === "error") {
+      connStatus = "error";
+      connMessage = message?.message || null;
+      connAttempt = message?.attempt ?? null;
+      connMaxAttempts = message?.maxAttempts ?? null;
+      buffering = false;
+      clearWatchdog();
+      updateStatusUI();
+    }
+  }
+
+  function requestRetry() {
+    if (isClosing) return;
+    connStatus = "reconnecting";
+    connMessage = null;
+    connAttempt = null;
+    connMaxAttempts = null;
+    if (!paused) buffering = true;
+    updateStatusUI();
+    armWatchdog();
+    try {
+      chrome.runtime.sendMessage({ type: "caption-retry" });
+    } catch (e) {
+      // Extension context gone; the error state stays with a Retry button.
     }
   }
 
@@ -643,6 +772,52 @@
         animation: none;
       }
 
+      .status-dot.is-error {
+        background: #f87171;
+      }
+
+      .captify-retry-btn {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        height: 26px;
+        padding: 0 12px;
+        border-radius: 8px;
+        border: 1px solid rgba(248, 113, 113, 0.5);
+        background: rgba(248, 113, 113, 0.16);
+        color: #fecaca;
+        font-size: 12px;
+        font-weight: 600;
+        letter-spacing: 0.01em;
+        cursor: pointer;
+        flex-shrink: 0;
+        outline: none;
+        transition: background 0.15s ease, border-color 0.15s ease, transform 0.1s ease;
+      }
+
+      .captify-retry-btn:hover {
+        background: rgba(248, 113, 113, 0.28);
+        border-color: rgba(248, 113, 113, 0.75);
+      }
+
+      .captify-retry-btn:active {
+        transform: scale(0.95);
+      }
+
+      .captify-retry-btn:focus-visible {
+        border-color: #f87171;
+        box-shadow: 0 0 0 2px rgba(248, 113, 113, 0.25);
+      }
+
+      .captify-retry-btn[hidden] {
+        display: none;
+      }
+
+      /* display:flex above beats the hidden attribute; restore it. */
+      .captify-play-btn[hidden] {
+        display: none;
+      }
+
       @keyframes captify-pulse {
         0%, 100% { opacity: 1; }
         50% { opacity: 0.35; }
@@ -672,7 +847,7 @@
     });
   }
 
-  function makeDropdown(defaultCode, labelText, onChange) {
+  function makeDropdown(options, defaultCode, labelText, onChange, showBadge = true) {
     let selectedCode = defaultCode;
     let isOpen = false;
 
@@ -711,8 +886,10 @@
     const optionEls = new Map();
 
     function updateTriggerUI() {
-      const entry = LANGUAGES.find(([c]) => c === selectedCode) || LANGUAGES[0];
-      triggerText.innerHTML = `<span class="dd-badge">${entry[0]}</span><span>${entry[1]}</span>`;
+      const entry = options.find(([c]) => c === selectedCode) || options[0];
+      triggerText.innerHTML = showBadge
+        ? `<span class="dd-badge">${entry[0]}</span><span>${entry[1]}</span>`
+        : `<span>${entry[1]}</span>`;
       optionEls.forEach((el, code) => {
         el.classList.toggle("is-selected", code === selectedCode);
       });
@@ -751,13 +928,13 @@
       onChange(selectedCode);
     }
 
-    for (const [code, name] of LANGUAGES) {
+    for (const [code, name] of options) {
       const opt = document.createElement("div");
       opt.className = "dd-option";
       opt.setAttribute("role", "option");
       opt.innerHTML = `
         <span class="dd-option-left">
-          <span class="dd-badge">${code}</span>
+          ${showBadge ? `<span class="dd-badge">${code}</span>` : ""}
           <span>${name}</span>
         </span>
         <svg class="dd-check" viewBox="0 0 20 20" fill="currentColor">
@@ -786,12 +963,12 @@
       } else if (e.key === "ArrowDown" || e.key === "ArrowUp") {
         e.preventDefault();
         if (!isOpen) openMenu();
-        const idx = LANGUAGES.findIndex(([c]) => c === selectedCode);
+        const idx = options.findIndex(([c]) => c === selectedCode);
         const nextIdx =
           e.key === "ArrowDown"
-            ? Math.min(LANGUAGES.length - 1, idx + 1)
+            ? Math.min(options.length - 1, idx + 1)
             : Math.max(0, idx - 1);
-        selectCode(LANGUAGES[nextIdx][0]);
+        selectCode(options[nextIdx][0]);
       }
     });
 
@@ -824,11 +1001,12 @@
       }
     }
 
-    sourceDropdown?.close();
+    modeDropdown?.close();
     targetDropdown?.close();
     container?.classList.remove("is-visible");
 
     clearTimeout(hideTimeout);
+    clearWatchdog();
     hideTimeout = setTimeout(() => {
       chrome.runtime.onMessage.removeListener(onRuntimeMessage);
       resizeObserver?.disconnect();
@@ -849,12 +1027,17 @@
       body = null;
       statusBar = null;
       playBtn = null;
+      retryBtn = null;
       statusText = null;
       statusDot = null;
       currentLine = null;
       currentItemId = null;
       paused = false;
       buffering = true;
+      connStatus = "unknown";
+      connMessage = null;
+      connAttempt = null;
+      connMaxAttempts = null;
       // Allow re-injection when the user clicks the extension icon again
       window.__captifyCaptionInjected = false;
     }, 280);
@@ -889,8 +1072,12 @@
       </svg>
     `;
 
-    sourceDropdown = makeDropdown("en", "Original", sendLanguage);
-    targetDropdown = makeDropdown("en", "Translate to", sendLanguage);
+    modeDropdown = makeDropdown(MODES, "transcription", "Mode", sendConfig, false);
+    targetDropdown = makeDropdown(LANGUAGES, "en", "Translate to", sendConfig);
+    updateTargetVisibility();
+    // Announce the defaults so the backend starts in the shown mode
+    // even when the user never touches the dropdowns.
+    sendConfig();
 
     const divider = document.createElement("div");
     divider.className = "header-divider";
@@ -911,7 +1098,7 @@
     });
 
     header.appendChild(grip);
-    header.appendChild(sourceDropdown.el);
+    header.appendChild(modeDropdown.el);
     header.appendChild(targetDropdown.el);
     header.appendChild(divider);
     header.appendChild(closeBtn);
@@ -934,6 +1121,23 @@
       setPaused(!paused);
     });
 
+    retryBtn = document.createElement("button");
+    retryBtn.type = "button";
+    retryBtn.className = "captify-retry-btn";
+    retryBtn.hidden = true;
+    retryBtn.title = "Reconnect to the transcription server";
+    retryBtn.setAttribute("aria-label", "Retry connection");
+    retryBtn.innerHTML = `
+      <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M13.5 8a5.5 5.5 0 1 1-1.61-3.89M13.5 1.5v3h-3"/>
+      </svg>
+      <span>Retry</span>
+    `;
+    retryBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      requestRetry();
+    });
+
     const statusWrap = document.createElement("div");
     statusWrap.className = "captify-status";
     statusDot = document.createElement("span");
@@ -945,6 +1149,7 @@
     statusWrap.appendChild(statusText);
 
     statusBar.appendChild(playBtn);
+    statusBar.appendChild(retryBtn);
     statusBar.appendChild(statusWrap);
     container.appendChild(statusBar);
     updateStatusUI();
@@ -968,7 +1173,7 @@
 
     onWindowPointerDown = (e) => {
       if (host && !host.contains(e.target)) {
-        sourceDropdown.close();
+        modeDropdown.close();
         targetDropdown.close();
       }
     };
@@ -976,7 +1181,7 @@
 
     shadow.addEventListener("pointerdown", (e) => {
       if (!e.target.closest(".dd-field")) {
-        sourceDropdown.close();
+        modeDropdown.close();
         targetDropdown.close();
       }
     });
@@ -1076,7 +1281,7 @@
           dragging = true;
           didDrag = true;
           pinCurrentPosition();
-          sourceDropdown.close();
+          modeDropdown.close();
           targetDropdown.close();
           container.classList.add("is-dragging");
           try {
@@ -1175,6 +1380,16 @@
       buffering = false;
       updateStatusUI();
     }
+    // Captions arriving prove the transport works: clear a stale error
+    // (e.g. a recovered server-side blip) and disarm the watchdog.
+    if (connStatus !== "connected") {
+      connStatus = "connected";
+      connMessage = null;
+      connAttempt = null;
+      connMaxAttempts = null;
+      updateStatusUI();
+    }
+    clearWatchdog();
 
     if (!currentLine || (itemId != null && currentItemId !== itemId)) {
       currentLine = document.createElement("div");
@@ -1224,17 +1439,30 @@
       currentLine = null;
       currentItemId = null;
       // A new session starts waiting for backend subtitles: reveal the
-      // overlay immediately (icon click) and spin the play button.
+      // overlay immediately (icon click) and spin the play button. Reset
+      // any previous error: a fresh session gets a fresh watchdog.
+      connStatus = "unknown";
+      connMessage = null;
+      connAttempt = null;
+      connMaxAttempts = null;
       revealForRecording();
-      if (!paused && !buffering) {
-        buffering = true;
-        updateStatusUI();
-      } else {
-        updateStatusUI();
-      }
+      if (!paused) buffering = true;
+      updateStatusUI();
+      armWatchdog();
     } else if (message?.type === "caption-show") {
+      // Session (re)start reveal: same fresh-waiting treatment as a clear.
+      if (connStatus === "error" || connStatus === "unknown") {
+        connStatus = "unknown";
+        connMessage = null;
+        connAttempt = null;
+        connMaxAttempts = null;
+        if (!paused) buffering = true;
+        armWatchdog();
+      }
       revealForRecording();
       updateStatusUI();
+    } else if (message?.type === "caption-status") {
+      handleConnectionStatus(message);
     } else if(message?.type === "caption-teardown") {
       closeAndTeardown(false);
     }
