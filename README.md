@@ -83,8 +83,10 @@ modules), loaded in order before `src/content-script.js` — see
 
 The menu controls mirror shadcn/ui's Button/Badge/Progress/Separator/Avatar
 (real shadcn is React/Radix, which can't run in this Shadow-DOM content
-script); account state is a local demo profile in `lib/user-store.js` until
-an auth/billing backend exists.
+script). Account state is backed by Supabase Auth (`lib/supabase-auth.js`,
+email + Google) with quota/plan read from the backend
+(`GET /api/v1/me/quota`); see `lib/supabase-config.js` for the project
+setup and `Captify_new_server/SUPABASE_SETUP.md` for the full guide.
 
 Captify is gated on sign-in: while signed out, clicking the toolbar icon
 only reveals the subtitle window with a "Sign in to use Captify" message and

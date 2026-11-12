@@ -36,7 +36,7 @@
     function render() {
       if (destroyed) return;
       const s = userStore.getState();
-      const { usedMinutes: used, limitMinutes: limit } = s.quota;
+      const { usedMinutes: used, limitMinutes: limit } = userStore.quotaMinutes(s);
       popup.replaceChildren();
 
       // Account
@@ -52,18 +52,30 @@
       popup.appendChild(ui.el("div", "um-stack")).append(
         s.signedIn
           ? ui.button({ variant: "secondary", label: "Sign out", icon: icons.logOut, onClick: () => userStore.signOut() })
-          : ui.button({ variant: "default", label: "Sign in", icon: icons.logIn, onClick: () => userStore.signIn() }),
+          : ui.button({ variant: "default", label: "Sign in", icon: icons.logIn, onClick: () => {
+              // Auth lives on the separate sign-in page: close the menu
+              // and ask the worker to open it for this tab.
+              setOpen(false);
+              try {
+                chrome.runtime?.sendMessage({ type: "open-signin" });
+              } catch (e) { /* extension context gone */ }
+            } }),
       );
 
       // Quota
       popup.appendChild(ui.separator());
       popup.appendChild(sectionLabel(icons.gauge, "Quota"));
+      const { remainingMinutes } = userStore.quotaMinutes(s);
       const quotaRow = ui.el("div", "um-row");
       quotaRow.append(
         ui.el("span", "um-value", "Subtitle minutes"),
         ui.el("span", "um-value", `${used} / ${limit} min`),
       );
-      popup.append(quotaRow, ui.progress(used, limit), ui.el("div", "um-muted", s.quota.resetsLabel));
+      popup.append(
+        quotaRow,
+        ui.progress(used, limit),
+        ui.el("div", "um-muted", `${remainingMinutes} min remaining`),
+      );
 
       // User plan
       popup.appendChild(ui.separator());
@@ -93,7 +105,14 @@
       button.setAttribute("aria-expanded", String(isOpen));
       button.setAttribute("aria-label", isOpen ? "Close menu" : "Open menu");
       onOpenChange?.(isOpen);
-      if (isOpen) render();
+      if (isOpen) {
+        render();
+        // Pull the live plan + quota (a dashboard plan change or a
+        // just-finished session shows up the next time the menu opens).
+        try {
+          userStore.refreshQuota?.()?.catch?.(() => {});
+        } catch (e) { /* stale numbers stay until the next open */ }
+      }
     }
 
     button.addEventListener("click", (e) => { e.stopPropagation(); setOpen(!isOpen); });

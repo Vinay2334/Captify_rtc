@@ -16,6 +16,11 @@
       color: rgba(255,255,255,0.65); max-width: 420px;
     }
     .auth-gate-btn { width: auto; min-width: 150px; margin-top: 6px; }
+    .auth-gate-error {
+      margin: 0; font-size: 12px; line-height: 1.4; max-width: 300px;
+      color: #fda4af;
+    }
+    .auth-gate-error[hidden] { display: none; }
 
     /* Signed out: no captions, no transport controls — sign-in only. */
     .captify-panel.is-signed-out .captify-body,

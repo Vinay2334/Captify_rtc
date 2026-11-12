@@ -65,6 +65,12 @@
       NS.updateStatusUI();
     } else if (message?.type === "caption-status") {
       NS.handleConnectionStatus(message);
+    } else if (message?.type === "quota-update") {
+      // Live quota from the backend (opening state, periodic refresh,
+      // final commit): apply to the user menu's remaining-minutes view.
+      try {
+        NS.userStore?.applyQuota?.(message.quota);
+      } catch (e) { /* menu renders stale numbers until next open */ }
     } else if(message?.type === "caption-teardown") {
       NS.closeAndTeardown(false);
     }

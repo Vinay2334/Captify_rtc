@@ -82,6 +82,15 @@ async function releaseSharedAudioContext() {
 function createSession(tabId) {
   return {
     tabId,
+    // Supabase access token for the signaling POST (verified backend-side;
+    // the session is billed to this user). Never logged.
+    authToken: null,
+    // Idempotency key for the logical subtitle session: minted per toolbar
+    // start, reused across reconnects/retries so the backend bills it once.
+    clientSessionId: null,
+    // Terminal auth/quota failure code (auth_expired/quota_exceeded):
+    // suppresses automatic background reconnects (manual Retry stays).
+    authTerminal: null,
     recorderNode: null,
     mediaStreamSource: null,
     audioContext: null,
@@ -272,7 +281,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           if (message.tabId == null) {
             throw new Error("start-recording missing tabId");
           }
-          await startRecording(message.tabId, message.data);
+          await startRecording(message.tabId, message.data, {
+            authToken: message.authToken || null,
+            clientSessionId: message.clientSessionId || null,
+          });
           break;
         case "stop-recording":
           if (message.tabId == null) {
@@ -404,11 +416,37 @@ function handleServerMessage(session, raw) {
         broadcastCaption(session, "", seg, true);
       }
     }
+  } else if (msg.type === "quota.update") {
+    // Live quota from the backend (opening state, periodic refresh while
+    // running, final commit). Forwarded to the tab overlay, which applies
+    // it to the user menu's remaining-minutes display.
+    try {
+      chrome.runtime.sendMessage({
+        type: "quota-update",
+        target: "captions",
+        tabId: session.tabId,
+        quota: {
+          used_seconds: msg.used_seconds,
+          limit_seconds: msg.limit_seconds,
+          remaining_seconds: msg.remaining_seconds,
+          plan: msg.plan,
+        },
+      });
+    } catch (e) {
+      console.warn("Failed to broadcast quota-update:", e);
+    }
   } else if (msg.type === "error") {
     // Server-side failure (e.g. backend transcription error): surface it in
     // the overlay instead of only logging. The transport itself is still up,
     // so the session keeps running — the overlay shows the message with a
     // Retry button that re-establishes the session server-side.
+    //
+    // Auth/quota errors are terminal for this transport: no automatic
+    // background reconnect (the user signs in again, or upgrades and hits
+    // Retry, which re-authorizes with a fresh signaling round-trip).
+    if (msg.code === "quota_exceeded" || msg.code === "auth_expired") {
+      session.authTerminal = msg.code;
+    }
     console.warn("Transcription server error:", msg.code, msg.message);
     notifyConnectionStatus(session, "error", {
       message:
@@ -498,6 +536,12 @@ async function ensureConnection(session) {
 // Short, actionable overlay text for a terminal connection failure.
 function friendlyConnectError(e) {
   const detail = e?.message || String(e || "");
+  if (/auth_expired|session expired/i.test(detail)) {
+    return "Session expired. Sign in again to continue captions.";
+  }
+  if (/quota_exceeded|quota exhausted/i.test(detail)) {
+    return detail.replace(/^quota_exceeded:\s*/, "");
+  }
   if (/failed to fetch|networkerror|load failed/i.test(detail)) {
     return "Couldn't reach the transcription server. Check that the backend is running, then retry.";
   }
@@ -514,6 +558,9 @@ function friendlyConnectError(e) {
 function scheduleReconnect(session) {
   const live = getLiveSession(session);
   if (!live || session.connectionPromise || session.reconnectTimer) return;
+  // Terminal auth/quota failure: background reconnects would just burn
+  // signaling calls. The overlay shows Retry for the user's next action.
+  if (live.authTerminal) return;
   if (isConnectionAlive(session)) return;
   session.reconnectTimer = setTimeout(() => {
     session.reconnectTimer = null;
@@ -559,7 +606,7 @@ async function retryConnection(tabId) {
   if (ok) sendLangConfig(session);
 }
 
-async function startRecording(tabId, streamId) {
+async function startRecording(tabId, streamId, opts = {}) {
   let session = sessions.get(tabId);
   if (session?.recorderNode) {
     throw new Error(
@@ -571,6 +618,12 @@ async function startRecording(tabId, streamId) {
     sessions.set(tabId, session);
     updateRecordingHash();
   }
+  // Fresh toolbar start: new identity for billing; a reconnecting session
+  // object keeps the id it was created with.
+  session.authToken = opts.authToken || session.authToken || null;
+  session.clientSessionId =
+    opts.clientSessionId || session.clientSessionId || `tab-${tabId}-${Date.now()}`;
+  session.authTerminal = null;
   // Picks announced before this session existed (content-script defaults).
   const knownLang = pendingLangConfig.get(tabId);
   if (knownLang) session.langConfig = knownLang;
@@ -759,7 +812,7 @@ async function setupPeerConnection(session) {
   const offer = await session.peerConnection.createOffer();
   await session.peerConnection.setLocalDescription(offer);
   await waitForIceGatheringComplete(session.peerConnection);
-  const answer = await exchangeOffer(session.peerConnection.localDescription);
+  const answer = await exchangeOffer(session.peerConnection.localDescription, session);
   await session.peerConnection.setRemoteDescription(answer);
   console.log("WebRTC peer connection established.");
   // Signaling can succeed while the channel itself never opens; without this
@@ -833,33 +886,74 @@ function waitForIceGatheringComplete(pc) {
   });
 }
 
-async function exchangeOffer(localDescription) {
+async function exchangeOffer(localDescription, session) {
   const signalUrl = RTC_CONFIG.SIGNAL_URL;
-  console.log(
-    "Sending offer to signaling server:",
-    signalUrl,
-    localDescription,
-  );
+  console.log("Sending offer to signaling server:", signalUrl);
+  const headers = { "Content-Type": "application/json" };
+  // The user's own access token; verified backend-side (service_role key
+  // never enters the extension).
+  if (session?.authToken) {
+    headers["Authorization"] = `Bearer ${session.authToken}`;
+  }
   // A hung backend must fail this attempt fast (into the retry loop), not
   // hang one attempt forever while the overlay spins.
   const res = await fetch(signalUrl, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers,
     body: JSON.stringify({
       sdp: localDescription.sdp,
       type: localDescription.type,
+      client_session_id: session?.clientSessionId || undefined,
     }),
     signal: AbortSignal.timeout(SIGNAL_TIMEOUT_MS),
   });
   if (!res.ok) {
+    let code = null;
+    let quota = null;
+    try {
+      const body = await res.json();
+      code = body?.code || null;
+      quota = body?.quota || null;
+    } catch (e) { /* non-JSON error page */ }
+    if (res.status === 401 || code === "auth_expired") {
+      if (session) session.authTerminal = "auth_expired";
+      throw new Error("auth_expired: Session expired. Sign in again.");
+    }
+    if (res.status === 402 || code === "quota_exceeded") {
+      if (session) session.authTerminal = "quota_exceeded";
+      if (quota && session) broadcastQuota(session, quota);
+      throw new Error(
+        `quota_exceeded: ${quota ? `${Math.max(Math.ceil((quota.remaining_seconds || 0) / 60), 0)} min left. ` : ""}Subtitle quota exhausted. Upgrade your plan to continue.`,
+      );
+    }
     throw new Error(`Signaling failed: ${res.status} ${res.statusText}`);
   }
   const answer = await res.json();
-  console.log("Received answer from signaling server:", answer);
+  console.log("Received answer from signaling server.");
+  // Opening quota state rides the answer so the menu is live immediately.
+  if (answer?.quota && session) broadcastQuota(session, answer.quota);
   return new RTCSessionDescription({
     sdp: answer.sdp,
     type: answer.type || "answer",
   });
+}
+
+function broadcastQuota(session, quota) {
+  try {
+    chrome.runtime.sendMessage({
+      type: "quota-update",
+      target: "captions",
+      tabId: session.tabId,
+      quota: {
+        used_seconds: quota.used_seconds,
+        limit_seconds: quota.limit_seconds,
+        remaining_seconds: quota.remaining_seconds,
+        plan: quota.plan,
+      },
+    });
+  } catch (e) {
+    console.warn("Failed to broadcast quota-update:", e);
+  }
 }
 
 function sendChunk(session, audioData) {

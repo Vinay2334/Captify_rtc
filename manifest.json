@@ -1,21 +1,21 @@
 {
   "name": "Tab Capture - Recorder (WebRTC)",
   "description": "Records the current tab in an offscreen document and streams audio over WebRTC.",
-  "version": "1",
+  "version": "1.0.0",
   "manifest_version": 3,
   "minimum_chrome_version": "116",
   "action": {
     "default_icon": "icons/not-recording.png"
   },
   "content_security_policy": {
-    "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'; connect-src http://127.0.0.1:8000/; "
+    "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'; connect-src http://127.0.0.1:8000/ https://*.supabase.co;"
   },
   "background": {
     "service_worker": "service-worker.js",
     "type": "module"
   },
-  "permissions": ["tabCapture", "offscreen", "downloads", "scripting", "activeTab", "storage"],
-  "host_permissions": ["http://127.0.0.1:8000/*"],
+  "permissions": ["tabCapture", "offscreen", "downloads", "scripting", "activeTab", "storage", "identity"],
+  "host_permissions": ["http://127.0.0.1:8000/*", "https://*.supabase.co/*"],
   "content_scripts": [
     {
       "matches": ["<all_urls>"],
@@ -29,6 +29,8 @@
         "caption-overlay/components/subtitle-panel.js",
         "caption-overlay/components/captions.js",
         "caption-overlay/lib/icons.js",
+        "caption-overlay/lib/supabase-config.js",
+        "caption-overlay/lib/supabase-auth.js",
         "caption-overlay/lib/user-store.js",
         "caption-overlay/components/ui.js",
         "caption-overlay/styles/user-menu.css.js",

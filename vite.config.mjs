@@ -44,6 +44,12 @@ function copyExtensionAssets() {
       cpSync(resolve(srcDir, "caption-overlay"), resolve(outDir, "caption-overlay"), {
         recursive: true,
       });
+      // Standalone sign-in page (opened as a popup window from the gate /
+      // menu): classic scripts + styles, copied verbatim like the content
+      // script — no bundling, so no CSP or load-order surprises.
+      for (const file of ["signin.html", "signin.js", "signin.css"]) {
+        copyFileSync(resolve(srcDir, file), resolve(outDir, file));
+      }
       const iconsDir = resolve(projectRoot, "icons");
       if (existsSync(iconsDir)) {
         cpSync(iconsDir, resolve(outDir, "icons"), { recursive: true });

@@ -25,6 +25,8 @@ async function ensureCaptionScript(tabId) {
         "caption-overlay/components/subtitle-panel.js",
         "caption-overlay/components/captions.js",
         "caption-overlay/lib/icons.js",
+        "caption-overlay/lib/supabase-config.js",
+        "caption-overlay/lib/supabase-auth.js",
         "caption-overlay/lib/user-store.js",
         "caption-overlay/components/ui.js",
         "caption-overlay/styles/user-menu.css.js",
@@ -51,6 +53,19 @@ async function isSignedIn() {
     return !!res?.captifyUserState?.signedIn;
   } catch (e) {
     return false;
+  }
+}
+
+// The user's own Supabase access token (lib/supabase-auth.js persists it
+// under this key). Forwarded to the offscreen document, which attaches it
+// to the WebRTC signaling POST; the backend verifies it and bills the
+// session to this user. The service_role key never enters the extension.
+async function getAccessToken() {
+  try {
+    const res = await chrome.storage.local.get("captifySupabaseSession");
+    return res?.captifySupabaseSession?.access_token || null;
+  } catch (e) {
+    return null;
   }
 }
 
@@ -174,11 +189,19 @@ async function startTabRecording(tabId) {
   // session. The offscreen document may not have registered its onMessage
   // listener yet right after createDocument, in which case sendMessage
   // rejects and the message would be silently lost. Retry until it lands.
+  //
+  // clientSessionId identifies this logical subtitle session across
+  // reconnects/retries so the backend bills it exactly once (idempotent
+  // commit). A fresh toolbar start mints a new id; a Retry reuses it.
   const message = {
     type: "start-recording",
     target: "offscreen",
     tabId,
     data: streamId,
+    authToken: await getAccessToken(),
+    clientSessionId:
+      globalThis.crypto?.randomUUID?.() ??
+      `${Date.now()}-${Math.random().toString(36).slice(2)}`,
   };
   try {
     for (let attempt = 0; attempt < 20; attempt++) {
@@ -244,8 +267,33 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo) => {
   }
 });
 
+// The auth form lives on a separate page (signin.html) because the
+// subtitle overlay is too small for comfortable input. The gate/menu ask
+// for it with "open-signin"; the worker opens a focused popup carrying
+// the originating tab id, and the page reports back "sign-in" with it.
+async function openSigninPage(tabId) {
+  const url = new URL(chrome.runtime.getURL("signin.html"));
+  if (tabId != null) url.searchParams.set("tabId", String(tabId));
+  try {
+    await chrome.windows.create({
+      url: url.toString(),
+      type: "popup",
+      width: 420,
+      height: 640,
+      focused: true,
+    });
+  } catch (e) {
+    console.warn("open-signin failed:", e?.message || e);
+  }
+}
+
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   (async () => {
+    if (message.type === "open-signin") {
+      await openSigninPage(message.tabId ?? sender?.tab?.id);
+      sendResponse?.({ ok: true, handled: true });
+      return;
+    }
     if (message.type === "captify-menu-action") {
       // User-menu / sign-in-gate actions from a tab overlay. The overlay
       // already flipped its local state (caption-overlay/lib/user-store.js);
@@ -391,7 +439,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     } else if (
       message.type === "caption" ||
       message.type === "caption-clear" ||
-      message.type === "caption-status"
+      message.type === "caption-status" ||
+      message.type === "quota-update"
     ) {
       // Live transcript from one tab's session in the offscreen document:
       // relay to that tab's caption overlay. Not awaited by the sender
