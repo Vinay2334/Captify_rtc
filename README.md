@@ -66,6 +66,34 @@ stable, hash-free filenames and copies `manifest.json`,
 is an ESM module imported by `offscreen.js`, so there is no more
 separate `<script>` tag or `globalThis` load-order race.
 
+## Caption overlay
+
+The old 1.5k-line `src/content-script.js` is now a ~70-line bootstrap; the
+implementation lives in `src/caption-overlay/` as classic scripts sharing
+`window.CaptifyOverlay` (no imports/exports — content scripts can't be
+modules), loaded in order before `src/content-script.js` — see
+`manifest.json` and `ensureCaptionScript` in `src/service-worker.js`:
+
+- `lib/constants.js`, `lib/state.js` — shared constants and mutable overlay state.
+- `lib/session.js` — sign-in gate, transport health, watchdog, pause/retry.
+- `styles/overlay.css.js`, `components/dropdown.js`, `components/status-bar.js`,
+  `components/subtitle-panel.js`, `components/captions.js` — the subtitle window.
+- `components/user-menu.js`, `components/sign-in-gate.js` (+ `lib/user-store.js`,
+  `components/ui.js`, styles) — hamburger menu and signed-out gate.
+
+The menu controls mirror shadcn/ui's Button/Badge/Progress/Separator/Avatar
+(real shadcn is React/Radix, which can't run in this Shadow-DOM content
+script); account state is a local demo profile in `lib/user-store.js` until
+an auth/billing backend exists.
+
+Captify is gated on sign-in: while signed out, clicking the toolbar icon
+only reveals the subtitle window with a "Sign in to use Captify" message and
+Sign in button (`components/sign-in-gate.js`) — no capture starts, captions
+are dropped, and session controls are disabled in the overlay, and the
+service worker refuses to start/retry/pause a session. Signing in (gate or
+menu) starts the tab's session; signing out stops every tab's session and
+returns all overlays to the gate.
+
 ## Load it
 
 1. Run `npm run build` (or `npm run dev` and leave it watching).

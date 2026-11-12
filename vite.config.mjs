@@ -39,6 +39,11 @@ function copyExtensionAssets() {
         resolve(srcDir, "content-script.js"),
         resolve(outDir, "content-script.js")
       );
+      // Same for the caption-overlay modules (hamburger / user menu):
+      // classic scripts loaded in order before content-script.js.
+      cpSync(resolve(srcDir, "caption-overlay"), resolve(outDir, "caption-overlay"), {
+        recursive: true,
+      });
       const iconsDir = resolve(projectRoot, "icons");
       if (existsSync(iconsDir)) {
         cpSync(iconsDir, resolve(outDir, "icons"), { recursive: true });

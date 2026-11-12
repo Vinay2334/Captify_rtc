@@ -13,13 +13,44 @@ async function ensureCaptionScript(tabId) {
   try {
     await chrome.scripting.executeScript({
       target: { tabId, allFrames: false },
-      files: ["content-script.js"],
+      // Order matters: caption-overlay/* are classic scripts that register
+      // window.CaptifyOverlay before content-script.js consumes it.
+      files: [
+        "caption-overlay/lib/constants.js",
+        "caption-overlay/lib/state.js",
+        "caption-overlay/lib/session.js",
+        "caption-overlay/styles/overlay.css.js",
+        "caption-overlay/components/dropdown.js",
+        "caption-overlay/components/status-bar.js",
+        "caption-overlay/components/subtitle-panel.js",
+        "caption-overlay/components/captions.js",
+        "caption-overlay/lib/icons.js",
+        "caption-overlay/lib/user-store.js",
+        "caption-overlay/components/ui.js",
+        "caption-overlay/styles/user-menu.css.js",
+        "caption-overlay/components/user-menu.js",
+        "caption-overlay/styles/sign-in-gate.css.js",
+        "caption-overlay/components/sign-in-gate.js",
+        "content-script.js",
+      ],
     });
   } catch (e) {
     // Expected on chrome://, edge://, Chrome Web Store, etc. where content
     // scripts can't run; the declarative content_scripts entry covers
     // ordinary http(s) pages.
     console.warn("Caption script injection skipped:", e?.message || e);
+  }
+}
+
+// Captify only works signed in. The overlay's user store persists its
+// state under this key (caption-overlay/lib/user-store.js); the worker is
+// the enforcement point — no capture session starts while signed out.
+async function isSignedIn() {
+  try {
+    const res = await chrome.storage.local.get("captifyUserState");
+    return !!res?.captifyUserState?.signedIn;
+  } catch (e) {
+    return false;
   }
 }
 
@@ -101,7 +132,7 @@ async function reconcileRecordingTabs() {
   }
 }
 
-async function stopTabRecording(tabId) {
+async function stopTabRecording(tabId, { teardownOverlay = true } = {}) {
   try {
     await chrome.runtime.sendMessage({
       type: "stop-recording",
@@ -111,7 +142,8 @@ async function stopTabRecording(tabId) {
   } catch (e) {
     console.warn("stop-recording delivery failed:", e?.message || e);
   }
-  await sendToTab(tabId, { type: "caption-teardown" });
+  // Sign-out stops the session but keeps the overlay up showing the gate.
+  if (teardownOverlay) await sendToTab(tabId, { type: "caption-teardown" });
   recordingTabs.delete(tabId);
   try {
     await chrome.action.setIcon({ path: "icons/not-recording.png", tabId });
@@ -182,6 +214,15 @@ chrome.action.onClicked.addListener(async (tab) => {
     return;
   }
 
+  if (!(await isSignedIn())) {
+    // Signed out: reveal the subtitle window with its sign-in gate only.
+    // No tabCapture, no offscreen session — Captify runs after sign-in,
+    // which arrives as a captify-menu-action from the overlay.
+    await ensureCaptionScript(tab.id);
+    await sendToTab(tab.id, { type: "caption-show" });
+    return;
+  }
+
   await startTabRecording(tab.id);
 });
 
@@ -205,6 +246,39 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo) => {
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   (async () => {
+    if (message.type === "captify-menu-action") {
+      // User-menu / sign-in-gate actions from a tab overlay. The overlay
+      // already flipped its local state (caption-overlay/lib/user-store.js);
+      // here we enforce it: sign-in starts this tab's session, sign-out
+      // stops it (overlay stays up showing the gate).
+      const tabId = message.tabId ?? sender?.tab?.id;
+      if (message.action === "sign-in" && tabId != null) {
+        await reconcileRecordingTabs();
+        if (!recordingTabs.has(tabId)) {
+          try {
+            await startTabRecording(tabId);
+          } catch (e) {
+            console.warn("sign-in start failed:", e?.message || e);
+            await sendToTab(tabId, {
+              type: "caption-status",
+              tabId,
+              status: "error",
+              message:
+                "Couldn't start captions. Check that the backend is running, then retry.",
+            });
+          }
+        }
+      } else if (message.action === "sign-out") {
+        // Signed out everywhere: stop every tab's session. Overlays stay
+        // up showing the sign-in gate (their stores sync via storage).
+        await reconcileRecordingTabs();
+        for (const id of [...recordingTabs]) {
+          await stopTabRecording(id, { teardownOverlay: false });
+        }
+      }
+      sendResponse?.({ ok: true, handled: true });
+      return;
+    }
     if (message.type === "caption-close") {
       // Close button clicked inside the tab's subtitle menu bar:
       // stop this tab's offscreen recording session and tear down offscreen.html
@@ -222,7 +296,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       // (mid-session drop) just reconnects; a torn-down session (startup
       // failure) needs a full restart with a fresh capture stream.
       const tabId = message.tabId ?? sender?.tab?.id;
-      if (tabId != null) {
+      if (tabId != null && (await isSignedIn())) {
         await reconcileRecordingTabs();
         if (recordingTabs.has(tabId)) {
           try {
@@ -274,7 +348,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       // Dropdown picks from a tab's subtitle window. The content script has
       // no tabId of its own, so identify the tab from the message sender.
       const tabId = message.tabId ?? sender?.tab?.id;
-      if (tabId != null) {
+      if (tabId != null && (await isSignedIn())) {
         try {
           await chrome.runtime.sendMessage({
             type: "caption-language",
@@ -294,7 +368,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       // pause/resume for that tab's offscreen session so pausing also stops
       // audio streaming, not just the overlay.
       const tabId = message.tabId ?? sender?.tab?.id;
-      if (tabId != null) {
+      if (tabId != null && (await isSignedIn())) {
         try {
           await chrome.runtime.sendMessage({
             type: message.paused ? "pause-recording" : "resume-recording",

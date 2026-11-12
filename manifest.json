@@ -14,12 +14,29 @@
     "service_worker": "service-worker.js",
     "type": "module"
   },
-  "permissions": ["tabCapture", "offscreen", "downloads", "scripting", "activeTab"],
+  "permissions": ["tabCapture", "offscreen", "downloads", "scripting", "activeTab", "storage"],
   "host_permissions": ["http://127.0.0.1:8000/*"],
   "content_scripts": [
     {
       "matches": ["<all_urls>"],
-      "js": ["content-script.js"],
+      "js": [
+        "caption-overlay/lib/constants.js",
+        "caption-overlay/lib/state.js",
+        "caption-overlay/lib/session.js",
+        "caption-overlay/styles/overlay.css.js",
+        "caption-overlay/components/dropdown.js",
+        "caption-overlay/components/status-bar.js",
+        "caption-overlay/components/subtitle-panel.js",
+        "caption-overlay/components/captions.js",
+        "caption-overlay/lib/icons.js",
+        "caption-overlay/lib/user-store.js",
+        "caption-overlay/components/ui.js",
+        "caption-overlay/styles/user-menu.css.js",
+        "caption-overlay/components/user-menu.js",
+        "caption-overlay/styles/sign-in-gate.css.js",
+        "caption-overlay/components/sign-in-gate.js",
+        "content-script.js"
+      ],
       "run_at": "document_idle",
       "all_frames": false
     }
