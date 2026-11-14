@@ -68,8 +68,7 @@
   function userFromSupabase(su) {
     if (!su) return null;
     const meta = su.user_metadata || {};
-    const name =
-      meta.full_name || meta.name || (su.email ? su.email.split("@")[0] : "Captify User");
+    const name = `${meta.first_name} ${meta.last_name}` || (su.email ? su.email.split("@")[0] : "Captify User");
     const user = { id: su.id || null, name, email: su.email || "" };
     user.initials = initialsFor(user);
     return user;
@@ -211,8 +210,8 @@
       const { user } = await NS.supabaseAuth.signInWithPassword(email, password);
       return setSignedIn(user);
     },
-    async signUpWithPassword(email, password) {
-      const { session, user } = await NS.supabaseAuth.signUp(email, password);
+    async signUpWithPassword(email, password, firstName, lastName) {
+      const { session, user } = await NS.supabaseAuth.signUp(email, password, firstName, lastName);
       // Email confirmation on: no session yet — stay signed out with a
       // message for the gate; the user signs in after clicking the link.
       if (!session) return { needsConfirmation: true, user: userFromSupabase(user) };

@@ -32,16 +32,55 @@
     const form = $("signin-form");
     const emailInput = $("signin-email");
     const passwordInput = $("signin-password");
+    const firstNameInput = $("signin-firstname");
+    const lastNameInput = $("signin-lastname");
+    const modeToggle = $("signin-toggle");
+    const modeMessage = $("signin-toggle-message");
+    const mNameRow = $("signin-name-row");
     const submitBtn = $("signin-submit");
     const googleBtn = $("signin-google");
-    const signupBtn = $("signin-signup");
     const errorLine = $("signin-error");
     const signedinBox = $("signin-signedin");
     const welcomeLine = $("signin-welcome");
-    const continueBtn = $("signin-continue");
-    const closeBtn = $("signin-close");
     const tabId = tabIdFromQuery(location || {});
     let busy = false;
+    let authMode = "signin";
+
+    function setAuthMode(mode) {
+      authMode = mode;
+
+      const isSignup = mode === "signup";
+
+      mNameRow.hidden = !isSignup;
+
+      firstNameInput.disabled = !isSignup;
+      lastNameInput.disabled = !isSignup;
+      firstNameInput.hidden = !isSignup;
+      lastNameInput.hidden = !isSignup;
+
+      firstNameInput.required = isSignup;
+      lastNameInput.required = isSignup;
+
+      passwordInput.autocomplete = isSignup
+        ? "new-password"
+        : "current-password";
+
+      submitBtn.textContent = isSignup ? "Create account" : "Sign in";
+
+      modeToggle.textContent = isSignup ? "Sign In" : "Sign Up";
+
+      modeMessage.textContent = isSignup
+        ? "Already have an account?"
+        : "Don't have an account?";
+
+      errorLine.hidden = true;
+      errorLine.textContent = "";
+    }
+    modeToggle.addEventListener("click", (e) => {
+      e.preventDefault();
+      setAuthMode(authMode === "signin" ? "signup" : "signin");
+    });
+    setAuthMode("signin");
 
     function showError(err) {
       errorLine.textContent = err?.message || String(err || "Sign-in failed.");
@@ -51,82 +90,89 @@
     // The tab login notification rides the store's own "sign-in"
     // message (originTabId registered below); here just close up.
     function closeAfterLogin() {
-      try { window.close(); } catch (e) { /* user closes manually */ }
-    }
-
-    // Already signed in (opened the page twice, or session restored):
-    // the store won't notify again, so report this tab explicitly.
-    function notifySignedIn() {
       try {
-        chrome.runtime?.sendMessage({
-          type: "captify-menu-action",
-          action: "sign-in",
-          tabId,
-        });
-      } catch (e) { /* worker will pick up storage state instead */ }
-      closeAfterLogin();
+        window.close();
+      } catch (e) {
+        /* user closes manually */
+      }
     }
 
     function refresh() {
       const s = userStore.getState();
       const signedIn = !!s.signedIn;
+
       signedinBox.hidden = !signedIn;
       form.hidden = signedIn;
       googleBtn.hidden = signedIn;
-      signupBtn.hidden = signedIn;
+
       if (signedIn && s.user) {
-        welcomeLine.textContent =
-          `Signed in as ${s.user.email || s.user.name}. Captions are unlocked.`;
+        welcomeLine.textContent = `Signed in as ${s.user.email || s.user.name}. Captions are unlocked.`;
       }
     }
 
     async function run(fn) {
       if (busy) return;
+
       busy = true;
       errorLine.hidden = true;
-      for (const b of [submitBtn, googleBtn, signupBtn]) {
-        try { b.disabled = true; } catch (e) { /* stub DOM */ }
-      }
+
+      submitBtn.disabled = true;
+      googleBtn.disabled = true;
+
       try {
         await fn();
       } catch (e) {
         showError(e);
       } finally {
         busy = false;
-        for (const b of [submitBtn, googleBtn, signupBtn]) {
-          try { b.disabled = false; } catch (e) { /* stub DOM */ }
-        }
+
+        submitBtn.disabled = false;
+        googleBtn.disabled = false;
       }
     }
 
     // Register the opener before any login attempt so the store's
     // "sign-in" notification carries this tab.
-    try { userStore.setOriginTab?.(tabId); } catch (e) { /* optional */ }
+    try {
+      userStore.setOriginTab?.(tabId);
+    } catch (e) {
+      /* optional */
+    }
 
     form.addEventListener("submit", (e) => {
       e.preventDefault();
-      run(() => userStore
-        .signInWithPassword(emailInput.value, passwordInput.value)
-        .then(closeAfterLogin));
-    });
-    googleBtn.addEventListener("click", () => {
-      run(() => userStore.signInWithGoogle().then(closeAfterLogin));
-    });
-    signupBtn.addEventListener("click", () => {
-      run(() => userStore
-        .signUpWithPassword(emailInput.value, passwordInput.value)
-        .then((res) => {
+
+      if (!form.reportValidity()) return;
+
+      run(async () => {
+        if (authMode === "signup") {
+          const res = await userStore.signUpWithPassword(
+            emailInput.value.trim(),
+            passwordInput.value,
+            firstNameInput.value.trim(),
+            lastNameInput.value.trim(),
+          );
+
           if (res?.needsConfirmation) {
-            errorLine.textContent = "Check your inbox to confirm, then sign in.";
+            setAuthMode("signin");
+            errorLine.textContent = "Check your inbox to confirm your email, then sign in.";
             errorLine.hidden = false;
             return;
           }
+
           closeAfterLogin();
-        }));
+        } else {
+          await userStore.signInWithPassword(
+            emailInput.value.trim(),
+            passwordInput.value,
+          );
+
+          closeAfterLogin();
+        }
+      });
     });
-    continueBtn.addEventListener("click", notifySignedIn);
-    closeBtn.addEventListener("click", () => {
-      try { window.close(); } catch (e) { /* user closes manually */ }
+    googleBtn.addEventListener("click", () => {
+      run(() => userStore.signInWithGoogle().then(closeAfterLogin));
     });
 
     const unsubscribe = userStore.subscribe(refresh);
@@ -141,14 +187,29 @@
 
   // Real page boot: DOM is parsed before this classic script runs.
   try {
-    if (typeof document !== "undefined" && document.getElementById?.("signin-form")) {
+    if (
+      typeof document !== "undefined" &&
+      document.getElementById?.("signin-form")
+    ) {
       if (document.readyState === "loading") {
-        document.addEventListener("DOMContentLoaded", () => createSigninPage({
-          document, window, location, userStore: NS.userStore,
-        }));
+        document.addEventListener("DOMContentLoaded", () =>
+          createSigninPage({
+            document,
+            window,
+            location,
+            userStore: NS.userStore,
+          }),
+        );
       } else {
-        createSigninPage({ document, window, location, userStore: NS.userStore });
+        createSigninPage({
+          document,
+          window,
+          location,
+          userStore: NS.userStore,
+        });
       }
     }
-  } catch (e) { /* test harness without DOM */ }
+  } catch (e) {
+    /* test harness without DOM */
+  }
 })();

@@ -135,11 +135,11 @@
       return session?.access_token || null;
     },
 
-    async signUp(email, password) {
+    async signUp(email, password, firstName, lastName) {
       const res = await fetch(`${projectUrl()}/auth/v1/signup`, {
         method: "POST",
         headers: headers(),
-        body: JSON.stringify({ email: String(email || "").trim(), password }),
+        body: JSON.stringify({ email: String(email || "").trim(), password, data: { first_name: firstName, last_name: lastName } }),
       });
       if (!res.ok) throw new Error(await failMessage(res));
       const data = await res.json();

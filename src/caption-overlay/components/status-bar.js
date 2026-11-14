@@ -20,16 +20,16 @@
     S.playBtn.classList.toggle("is-paused", S.paused);
     if (showSpinner) {
       S.playBtn.innerHTML = '<span class="captify-spinner" aria-hidden="true"></span>';
-      S.playBtn.title = "Waiting for subtitles";
-      S.playBtn.setAttribute("aria-label", "Waiting for subtitles");
+      S.playBtn.title = "Waiting for Captions";
+      S.playBtn.setAttribute("aria-label", "Waiting for Captions");
     } else if (S.paused) {
       S.playBtn.innerHTML = SVG_PLAY;
-      S.playBtn.title = "Resume subtitles";
-      S.playBtn.setAttribute("aria-label", "Resume subtitles");
+      S.playBtn.title = "Resume Captions";
+      S.playBtn.setAttribute("aria-label", "Resume Captions");
     } else {
       S.playBtn.innerHTML = SVG_PAUSE;
-      S.playBtn.title = "Pause subtitles";
-      S.playBtn.setAttribute("aria-label", "Pause subtitles");
+      S.playBtn.title = "Pause Captions";
+      S.playBtn.setAttribute("aria-label", "Pause Captions");
     }
     S.statusDot.classList.toggle("is-live", !S.paused && !S.buffering && !isError);
     S.statusDot.classList.toggle("is-paused", S.paused && !isError);
@@ -54,7 +54,7 @@
       } else if (S.connStatus === "reconnecting") {
         S.statusText.textContent = "Reconnecting\u2026";
       } else {
-        S.statusText.textContent = "Waiting for subtitles\u2026";
+        S.statusText.textContent = "Waiting for Captions\u2026";
       }
       S.statusText.removeAttribute("title");
     } else {
@@ -99,7 +99,7 @@
     S.statusDot.className = "status-dot";
     S.statusDot.setAttribute("aria-hidden", "true");
     S.statusText = document.createElement("span");
-    S.statusText.textContent = "Waiting for subtitles\u2026";
+    S.statusText.textContent = "Waiting for Captions\u2026";
     statusWrap.appendChild(S.statusDot);
     statusWrap.appendChild(S.statusText);
 

@@ -444,7 +444,11 @@ function handleServerMessage(session, raw) {
     // Auth/quota errors are terminal for this transport: no automatic
     // background reconnect (the user signs in again, or upgrades and hits
     // Retry, which re-authorizes with a fresh signaling round-trip).
-    if (msg.code === "quota_exceeded" || msg.code === "auth_expired") {
+    if (
+      msg.code === "quota_exceeded" ||
+      msg.code === "auth_expired" ||
+      msg.code === "anonymous_disabled"
+    ) {
       session.authTerminal = msg.code;
     }
     console.warn("Transcription server error:", msg.code, msg.message);
@@ -536,6 +540,9 @@ async function ensureConnection(session) {
 // Short, actionable overlay text for a terminal connection failure.
 function friendlyConnectError(e) {
   const detail = e?.message || String(e || "");
+  if (/anonymous_disabled|anonymous sign-in is disabled/i.test(detail)) {
+    return "Anonymous sign-in is disabled. Sign in with email or Google.";
+  }
   if (/auth_expired|session expired/i.test(detail)) {
     return "Session expired. Sign in again to continue captions.";
   }
@@ -915,8 +922,13 @@ async function exchangeOffer(localDescription, session) {
       code = body?.code || null;
       quota = body?.quota || null;
     } catch (e) { /* non-JSON error page */ }
-    if (res.status === 401 || code === "auth_expired") {
-      if (session) session.authTerminal = "auth_expired";
+    if (res.status === 401 || code === "auth_expired" || code === "anonymous_disabled") {
+      if (session) session.authTerminal = code === "anonymous_disabled" ? "anonymous_disabled" : "auth_expired";
+      if (code === "anonymous_disabled") {
+        throw new Error(
+          "anonymous_disabled: Anonymous sign-in is disabled. Sign in with email or Google.",
+        );
+      }
       throw new Error("auth_expired: Session expired. Sign in again.");
     }
     if (res.status === 402 || code === "quota_exceeded") {

@@ -174,7 +174,7 @@ async function stopTabRecording(tabId, { teardownOverlay = true } = {}) {
 // button (which fires after a terminal connection error tore the session
 // down). Throws on synchronous failures (e.g. tabCapture denied); backend
 // connectivity failures surface later via caption-status from offscreen.
-async function startTabRecording(tabId) {
+async function startTabRecording(tabId, { initializeOverlay = true } = {}) {
   await ensureOffscreen();
 
   // Get a MediaStream for the tab.
@@ -183,7 +183,7 @@ async function startTabRecording(tabId) {
   });
 
   recordingTabs.add(tabId);
-  await ensureCaptionScript(tabId);
+  if(initializeOverlay) await ensureCaptionScript(tabId);
 
   // Send the stream ID to the offscreen document to start this tab's
   // session. The offscreen document may not have registered its onMessage
@@ -304,7 +304,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         await reconcileRecordingTabs();
         if (!recordingTabs.has(tabId)) {
           try {
-            await startTabRecording(tabId);
+            await startTabRecording(tabId, { initializeOverlay: false });
           } catch (e) {
             console.warn("sign-in start failed:", e?.message || e);
             await sendToTab(tabId, {
@@ -344,7 +344,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       // (mid-session drop) just reconnects; a torn-down session (startup
       // failure) needs a full restart with a fresh capture stream.
       const tabId = message.tabId ?? sender?.tab?.id;
-      if (tabId != null && (await isSignedIn())) {
+      if (tabId !== null && (await isSignedIn())) {
         await reconcileRecordingTabs();
         if (recordingTabs.has(tabId)) {
           try {
@@ -358,15 +358,14 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           }
         } else {
           try {
-            await startTabRecording(tabId);
+            await startTabRecording(tabId, { initializeOverlay: false });
           } catch (e) {
             console.warn("retry restart failed:", e?.message || e);
             await sendToTab(tabId, {
               type: "caption-status",
               tabId,
               status: "error",
-              message:
-                "Couldn't restart captions. Check that the backend is running, then retry.",
+              message: "Couldn't restart captions.",
             });
           }
         }

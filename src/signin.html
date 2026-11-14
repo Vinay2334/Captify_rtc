@@ -1,54 +1,86 @@
 <!doctype html>
 <html>
-<head>
-<meta charset="utf-8">
-<title>Sign in to use Captify</title>
-<link rel="stylesheet" href="./signin.css">
-</head>
-<body>
-<main class="signin-card" id="signin-card">
-  <h1 class="signin-title">Sign in to use Captify</h1>
-  <p class="signin-message">
-    Subtitles are off until you sign in. Sign in to start live captions
-    for your tab.
-  </p>
+  <head>
+    <meta charset="utf-8" />
+    <title>Sign in to use Captify</title>
+    <link rel="stylesheet" href="./signin.css" />
+  </head>
+  <body>
+    <main class="signin-card" id="signin-card">
+      <h1 class="signin-title">Sign in to use Captify</h1>
+      <p class="signin-message">
+        Subtitles are off until you sign in. Sign in to start live captions for
+        your tab.
+      </p>
 
-  <div class="signin-signedin" id="signin-signedin" hidden>
-    <p class="signin-message" id="signin-welcome"></p>
-    <button class="signin-btn signin-btn-primary" id="signin-continue" type="button">
-      Start captions for this tab
-    </button>
-    <button class="signin-btn signin-btn-ghost" id="signin-close" type="button">
-      Close
-    </button>
-  </div>
+      <form class="signin-form" id="signin-form" autocomplete="on">
+        <div class="signin-name-row" id="signin-name-row" hidden>
+          <input
+            class="signin-input"
+            id="signin-firstname"
+            type="text"
+            placeholder="First name"
+            autocomplete="given-name"
+            required
+          />
 
-  <form class="signin-form" id="signin-form" autocomplete="on">
-    <input class="signin-input" id="signin-email" type="email" name="email"
-      placeholder="Email" autocomplete="email" required>
-    <input class="signin-input" id="signin-password" type="password" name="password"
-      placeholder="Password" autocomplete="current-password" required>
-    <button class="signin-btn signin-btn-primary" id="signin-submit" type="submit">
-      Sign in
-    </button>
-  </form>
+          <input
+            class="signin-input"
+            id="signin-lastname"
+            type="text"
+            placeholder="Last name"
+            autocomplete="family-name"
+            required
+          />
+        </div>
+        <input
+          class="signin-input"
+          id="signin-email"
+          type="email"
+          name="email"
+          placeholder="Email"
+          autocomplete="email"
+          required
+        />
+        <input
+          class="signin-input"
+          id="signin-password"
+          type="password"
+          name="password"
+          placeholder="Password"
+          autocomplete="current-password"
+          required
+        />
+        <button
+          class="signin-btn signin-btn-primary"
+          id="signin-submit"
+          type="submit"
+        >
+          Sign in
+        </button>
+        <p>
+          <span id="signin-toggle-message"></span
+          ><a href="#" id="signin-toggle">Sign Up</a>
+        </p>
+      </form>
 
-  <div class="signin-divider" aria-hidden="true"><span>or</span></div>
+      <div class="signin-divider" aria-hidden="true"><span>or</span></div>
 
-  <button class="signin-btn signin-btn-secondary" id="signin-google" type="button">
-    Continue with Google
-  </button>
-  <button class="signin-btn signin-btn-ghost" id="signin-signup" type="button">
-    Create account
-  </button>
+      <button
+        class="signin-btn signin-btn-secondary"
+        id="signin-google"
+        type="button"
+      >
+        Continue with Google
+      </button>
 
-  <p class="signin-error" id="signin-error" role="alert" hidden></p>
-</main>
+      <p class="signin-error" id="signin-error" role="alert" hidden></p>
+    </main>
 
-<script src="./caption-overlay/lib/icons.js"></script>
-<script src="./caption-overlay/lib/supabase-config.js"></script>
-<script src="./caption-overlay/lib/supabase-auth.js"></script>
-<script src="./caption-overlay/lib/user-store.js"></script>
-<script src="./signin.js"></script>
-</body>
+    <script src="./caption-overlay/lib/icons.js"></script>
+    <script src="./caption-overlay/lib/supabase-config.js"></script>
+    <script src="./caption-overlay/lib/supabase-auth.js"></script>
+    <script src="./caption-overlay/lib/user-store.js"></script>
+    <script src="./signin.js"></script>
+  </body>
 </html>
