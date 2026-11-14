@@ -12,6 +12,10 @@
 (function () {
   const NS = (window.CaptifyOverlay = window.CaptifyOverlay || {});
 
+  // Same-document re-injection re-runs this script: keep the existing
+  // session instead of dropping it mid-recording.
+  if (NS.supabaseAuth) return;
+
   const STORAGE_KEY = "captifySupabaseSession";
   const REFRESH_SKEW_MS = 60 * 1000;
 

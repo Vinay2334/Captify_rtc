@@ -62,12 +62,57 @@
       S.connMessage = null;
       S.connAttempt = null;
       S.connMaxAttempts = null;
-      // Allow re-injection when the user clicks the extension icon again
+      // Allow re-injection when the user clicks the extension icon again:
+      // the closing flag must clear too, or the next reveal (and every
+      // runtime message) keeps early-returning and the overlay never
+      // reappears. State now survives re-injection, so teardown has to
+      // leave it reopenable explicitly.
+      S.isClosing = false;
       window.__captifyCaptionInjected = false;
     }, 280);
   }
   NS.ensureOverlay = function() {
-    if (S.container) return S.container;
+    // Reuse the live overlay when our host is the one in the document.
+    if (S.container && S.host && document.getElementById(C.CONTAINER_ID) === S.host) {
+      return S.container;
+    }
+    // Otherwise an earlier injection's host may still be in the document
+    // while this state no longer references it (or refs point at a detached
+    // tree): drop the orphan and stale wiring so the rebuild below leaves
+    // exactly one overlay host behind.
+    document.getElementById(C.CONTAINER_ID)?.remove();
+    if (S.onWindowPointerDown)
+      window.removeEventListener("pointerdown", S.onWindowPointerDown);
+    if (S.onWindowPointerMove)
+      window.removeEventListener("pointermove", S.onWindowPointerMove);
+    if (S.onWindowPointerUp) {
+      window.removeEventListener("pointerup", S.onWindowPointerUp);
+      window.removeEventListener("pointercancel", S.onWindowPointerUp);
+    }
+    S.resizeObserver?.disconnect();
+    S.userMenu?.destroy();
+    S.signInGate?.destroy();
+    S.unsubscribeAuth?.();
+    S.host = null;
+    S.shadow = null;
+    S.container = null;
+    S.headerWrap = null;
+    S.header = null;
+    S.body = null;
+    S.statusBar = null;
+    S.playBtn = null;
+    S.retryBtn = null;
+    S.statusText = null;
+    S.statusDot = null;
+    S.userMenu = null;
+    S.signInGate = null;
+    S.unsubscribeAuth = null;
+    S.modeDropdown = null;
+    S.targetDropdown = null;
+    S.resizeObserver = null;
+    S.onWindowPointerDown = null;
+    S.onWindowPointerMove = null;
+    S.onWindowPointerUp = null;
 
     S.host = document.createElement("div");
     S.host.id = C.CONTAINER_ID;

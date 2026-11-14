@@ -11,6 +11,9 @@
 // in minutes by the menu; remaining = limit - used, computed server-side.
 (function () {
   const NS = (window.CaptifyOverlay = window.CaptifyOverlay || {});
+  // Same-document re-injection re-runs this script: keep the existing store
+  // so subscriptions, loaded state and quota survive instead of resetting.
+  if (NS.userStore) return;
   const STORAGE_KEY = "captifyUserState";
 
   const DEFAULT_STATE = Object.freeze({

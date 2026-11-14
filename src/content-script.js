@@ -4,10 +4,23 @@
 // runtime-message entry, and mounts the overlay.
 (function () {
   console.log("content script loaded");
-  if (window.__captifyCaptionInjected) return;
+  const NS = (window.CaptifyOverlay = window.CaptifyOverlay || {});
+  if (window.__captifyCaptionInjected) {
+    // Same-document re-injection (manifest content_scripts + the service
+    // worker's executeScript after a navigation): reuse the single overlay
+    // and keep exactly one runtime listener instead of building another
+    // overlay host for the same page.
+    try {
+      chrome.runtime.onMessage.removeListener(NS.onRuntimeMessage);
+    } catch (e) {
+      // Listener was never registered (or context already gone).
+    }
+    if (NS.onRuntimeMessage) chrome.runtime.onMessage.addListener(NS.onRuntimeMessage);
+    NS.ensureOverlay();
+    return;
+  }
   window.__captifyCaptionInjected = true;
 
-  const NS = (window.CaptifyOverlay = window.CaptifyOverlay || {});
   const S = NS.state;
   const C = NS.constants;
   NS.onRuntimeMessage = function(message) {
