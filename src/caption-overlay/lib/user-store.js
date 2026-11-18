@@ -49,9 +49,20 @@
   // single "sign-in" notification carries the tab the worker must start.
   let originTabId = null;
 
-  function notifyBackend(action) {
+  // Concurrent expiry paths (refresh listener + quota 401) must send one
+  // sign-out notification: collapse overlapping signOut calls.
+  let signOutActive = null;
+  async function doSignOut() {
+    try { await NS.supabaseAuth?.signOut?.(); } catch (e) { /* local clear below */ }
+    state = structuredClone(DEFAULT_STATE);
+    persist();
+    emit();
+    notifyBackend("sign-out");
+  }
+
+  function notifyBackend(action, extra) {
     try {
-      const msg = { type: "captify-menu-action", action };
+      const msg = { type: "captify-menu-action", action, ...(extra || {}) };
       // tabId is always explicit (null when unknown) so the worker can
       // fall back to the sender tab without guessing about missing keys.
       if (action === "sign-in") msg.tabId = originTabId;
@@ -71,7 +82,7 @@
   function userFromSupabase(su) {
     if (!su) return null;
     const meta = su.user_metadata || {};
-    const name = `${meta.first_name} ${meta.last_name}` || (su.email ? su.email.split("@")[0] : "Captify User");
+    const name = (meta.first_name || meta.last_name ? `${meta?.first_name} ${meta?.last_name}` : null) || meta?.name || (su.email ? su.email.split("@")[0] : "Captify User");
     const user = { id: su.id || null, name, email: su.email || "" };
     user.initials = initialsFor(user);
     return user;
@@ -99,8 +110,30 @@
   }
 
   async function fetchQuota() {
-    const token = await NS.supabaseAuth?.getAccessToken?.();
-    if (!token) return null;
+    let token = await NS.supabaseAuth?.getAccessToken?.();
+    // Snapshot before the reload below: a concurrent expiry sign-out may
+    // flip state while we re-read storage, and the throw must not depend
+    // on winning that race.
+    const wasSignedIn = state.signedIn;
+    if (!token) {
+      // The sign-in popup writes the session from another context, which
+      // this overlay's in-memory auth may not have seen yet (its state
+      // arrived via the storage event, not a reload): re-read storage
+      // before concluding the session expired.
+      try { await NS.supabaseAuth?.load?.(); } catch (e) { /* keep going */ }
+      token = await NS.supabaseAuth?.getAccessToken?.();
+    }
+    if (!token) {
+      // No usable token AND no session left (the refresh rejected the
+      // grant and cleared it client-side): fall back to signed-out so the
+      // overlay shows the sign-in gate. A session still in memory means a
+      // transient refresh failure — stay signed in and retry next time.
+      if (wasSignedIn && !NS.supabaseAuth?.getSession?.()) {
+        await NS.userStore.signOut();
+        throw new Error("Session expired. Please sign in again.");
+      }
+      return null;
+    }
     const url = NS.captifyConfig?.quotaUrl?.();
     if (!url) return null;
     const res = await fetch(url, {
@@ -160,18 +193,20 @@
   async function restore() {
     const supa = await NS.supabaseAuth?.load?.();
     if (!supa) {
-      // No Supabase session but a stale signed-in flag: sign out cleanly.
-      if (state.signedIn) {
-        state = structuredClone(DEFAULT_STATE);
-        persist();
-        emit();
-        notifyBackend("sign-out");
-      }
+      // No Supabase session but a stale signed-in flag: sign out cleanly
+      // (deduped with the expiry subscriber's in-flight sign-out).
+      if (state.signedIn) await NS.userStore.signOut();
       return null;
     }
     let su = supa.user;
     if (!su) {
       try { su = await NS.supabaseAuth.getUser(); } catch (e) { su = null; }
+    }
+    if (!su && !NS.supabaseAuth.getSession?.()) {
+      // The stored session died (expired refresh cleared the client
+      // token): sign out instead of staying unlocked with no identity.
+      await NS.userStore.signOut();
+      return null;
     }
     state = {
       ...state,
@@ -229,13 +264,30 @@
       throw new Error("Choose email or Google sign-in.");
     },
     async signOut() {
-      try { await NS.supabaseAuth?.signOut?.(); } catch (e) { /* local clear below */ }
-      state = structuredClone(DEFAULT_STATE);
-      persist();
-      emit();
-      notifyBackend("sign-out");
+      // Join an in-flight sign-out; already signed out with no session
+      // left means nothing to clear or announce (keeps expiry races to a
+      // single worker notification).
+      if (signOutActive) return signOutActive;
+      if (!state.signedIn && !NS.supabaseAuth?.getSession?.()) return;
+      signOutActive = doSignOut().finally(() => { signOutActive = null; });
+      return signOutActive;
     },
-    upgrade() { notifyBackend("upgrade"); },
+    // Backend rejected the session (expired/invalid token): the client
+    // token is already gone — drive every overlay to the signed-out UI
+    // (sign-in gate) and stop capture via the worker's sign-out path.
+    async handleSessionExpired() {
+      console.log("Supabase session expired: signing out overlay and worker.", NS.supabaseAuth?.getSession?.());
+      if (!state.signedIn && !NS.supabaseAuth?.getSession?.()) return;
+      await NS.userStore.signOut();
+    },
+    // Content scripts can't open tabs directly (no chrome.tabs there), so
+    // the pricing URL is built here — where the account lives — and the
+    // service worker opens it after allow-listing it against SITE_URL.
+    upgrade() {
+      const s = NS.userStore.getState();
+      const url = NS.captifyConfig?.pricingUrl?.(s.user?.email, s.user?.id);
+      notifyBackend("upgrade", url ? { url } : undefined);
+    },
     getProPlan: () => ({ ...PRO_PLAN }),
     // Minutes shown in the menu (billing stays in seconds server-side).
     quotaMinutes(s = state) {
@@ -245,4 +297,13 @@
       return { usedMinutes: used, limitMinutes: limit, remainingMinutes: remaining };
     },
   };
+
+  // Expired refreshes already cleared the client token inside supabase-auth;
+  // sign the overlay out right away instead of retrying with nothing.
+  // Guarded: the module-load-order test loads this store without auth.
+  try {
+    NS.supabaseAuth?.onSessionExpired?.(() => {
+      NS.userStore?.handleSessionExpired?.()?.catch?.(() => {});
+    });
+  } catch (e) { /* auth unavailable */ }
 })();

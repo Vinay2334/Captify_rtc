@@ -149,3 +149,18 @@ test("getState returns a copy callers cannot mutate", () => {
   store.getState().quota.usedSeconds = 999;
   assert.equal(store.getState().quota.usedSeconds, 0);
 });
+
+test("upgrade opens pricing with the account attached", async () => {
+  const { store, sent } = loadUserStore();
+  await store.load();
+  await store.signInWithPassword("ada@captify.local", "secret");
+  sent.length = 0;
+  store.upgrade();
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].action, "upgrade");
+  const url = String(sent[0].url || "");
+  assert.ok(url.includes("/pricing.html?"));
+  assert.ok(url.includes("from=extension"));
+  assert.ok(url.includes("user_id=user-1"));
+  assert.ok(url.includes("email=" + encodeURIComponent("ada@captify.local")));
+});

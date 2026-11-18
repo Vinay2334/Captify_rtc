@@ -85,7 +85,18 @@
   let session = null;
   let loaded = false;
 
+  // Listeners run whenever the stored session is discarded because the
+  // backend rejected it (expired/invalid refresh). The overlay subscribes
+  // so it can fall back to the signed-out UI instead of retrying forever.
+  const expiredListeners = new Set();
+  function emitExpired() {
+    for (const fn of expiredListeners) {
+      try { fn(); } catch (e) { /* listener error */ }
+    }
+  }
+
   async function persist() {
+    console.log("Persisting session", session);
     if (session) await storageSet({ [STORAGE_KEY]: session });
     else await storageRemove(STORAGE_KEY);
   }
@@ -97,9 +108,17 @@
       headers: headers(),
       body: JSON.stringify({ refresh_token: session.refresh_token }),
     });
-    if (!res.ok) {
+    // Only 400/401 means the grant itself is dead (expired, revoked,
+    // rotated): discard the client token and tell the overlay to sign
+    // out. Anything else (500, 429, …) is transient — keep the session so
+    // a hiccup can't sign the user out; the next check retries.
+    if (res.status === 400 || res.status === 401) {
       session = null;
       await persist();
+      emitExpired();
+      return null;
+    }
+    if (!res.ok) {
       return null;
     }
     session = toSession(await res.json());
@@ -120,6 +139,11 @@
   const api = {
     isLoaded: () => loaded,
     getSession: () => (session ? { ...session } : null),
+    // Fires when the client discards its token after a backend rejection.
+    onSessionExpired(fn) {
+      expiredListeners.add(fn);
+      return () => expiredListeners.delete(fn);
+    },
 
     async load() {
       const stored = await storageGet(STORAGE_KEY);

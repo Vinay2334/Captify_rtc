@@ -8,41 +8,14 @@
     "default_icon": "icons/not-recording.png"
   },
   "content_security_policy": {
-    "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'; connect-src http://127.0.0.1:8000/ https://*.supabase.co;"
+    "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'; connect-src http://127.0.0.1:8000/ https://*.supabase.co; https://captify-new-server.vercel.app;"
   },
   "background": {
     "service_worker": "service-worker.js",
     "type": "module"
   },
   "permissions": ["tabCapture", "offscreen", "downloads", "scripting", "activeTab", "storage", "identity"],
-  "host_permissions": ["http://127.0.0.1:8000/*", "https://*.supabase.co/*"],
-  "content_scripts": [
-    {
-      "matches": ["<all_urls>"],
-      "js": [
-        "caption-overlay/lib/constants.js",
-        "caption-overlay/lib/state.js",
-        "caption-overlay/lib/session.js",
-        "caption-overlay/styles/overlay.css.js",
-        "caption-overlay/components/dropdown.js",
-        "caption-overlay/components/status-bar.js",
-        "caption-overlay/components/subtitle-panel.js",
-        "caption-overlay/components/captions.js",
-        "caption-overlay/lib/icons.js",
-        "caption-overlay/lib/supabase-config.js",
-        "caption-overlay/lib/supabase-auth.js",
-        "caption-overlay/lib/user-store.js",
-        "caption-overlay/components/ui.js",
-        "caption-overlay/styles/user-menu.css.js",
-        "caption-overlay/components/user-menu.js",
-        "caption-overlay/styles/sign-in-gate.css.js",
-        "caption-overlay/components/sign-in-gate.js",
-        "content-script.js"
-      ],
-      "run_at": "document_idle",
-      "all_frames": false
-    }
-  ],
+  "host_permissions": ["http://127.0.0.1:8000/*", "https://*.supabase.co/*", "https://captify-new-server.vercel.app/*"],
   "web_accessible_resources": [
     {
       "resources": ["recorder-processor.js"],

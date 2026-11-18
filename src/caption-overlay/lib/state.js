@@ -1,8 +1,8 @@
 // Single mutable overlay state. Modules read/write NS.state (alias S).
 (function () {
   const NS = (window.CaptifyOverlay = window.CaptifyOverlay || {});
-  // Same-document re-injection (manifest content_scripts + the service
-  // worker's executeScript on navigation) re-runs every classic script:
+  // Same-document re-injection (the worker's executeScript running the
+  // files twice) re-runs every classic script:
   // keep the existing state so the first injection's overlay refs survive
   // instead of being orphaned (which made the next reveal build a second
   // overlay host in the same page).

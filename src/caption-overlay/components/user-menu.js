@@ -100,6 +100,8 @@
 
     function setOpen(next) {
       if (destroyed || next === isOpen) return;
+      // Signed out: the menu must not open (sign-in lives in the gate).
+      if (next && !userStore.getState()?.signedIn) return;
       isOpen = next;
       popup.classList.toggle("is-open", isOpen);
       button.setAttribute("aria-expanded", String(isOpen));
@@ -120,8 +122,20 @@
     popup.addEventListener("pointerdown", (e) => e.stopPropagation());
     popup.addEventListener("keydown", (e) => { if (e.key === "Escape") { setOpen(false); button.focus(); } });
 
-    const unsubscribe = userStore.subscribe(render);
-    userStore.load(render);
+    // Sign-out while open must close the menu instead of re-rendering
+    // a signed-out view behind the open popup.
+    function handleStoreUpdate(nextState) {
+      const signedIn = !!(nextState?.signedIn ?? userStore.getState()?.signedIn);
+      if (!signedIn) {
+        if (isOpen) setOpen(false);
+        else render();
+        return;
+      }
+      render();
+    }
+
+    const unsubscribe = userStore.subscribe(handleStoreUpdate);
+    userStore.load(handleStoreUpdate);
     render();
 
     return {

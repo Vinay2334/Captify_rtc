@@ -6,10 +6,9 @@
   console.log("content script loaded");
   const NS = (window.CaptifyOverlay = window.CaptifyOverlay || {});
   if (window.__captifyCaptionInjected) {
-    // Same-document re-injection (manifest content_scripts + the service
-    // worker's executeScript after a navigation): reuse the single overlay
-    // and keep exactly one runtime listener instead of building another
-    // overlay host for the same page.
+    // Same-document re-injection (the worker's executeScript running the
+    // files twice): reuse the single overlay and keep exactly one runtime
+    // listener instead of building another overlay host for the same page.
     try {
       chrome.runtime.onMessage.removeListener(NS.onRuntimeMessage);
     } catch (e) {
@@ -23,7 +22,22 @@
 
   const S = NS.state;
   const C = NS.constants;
-  NS.onRuntimeMessage = function(message) {
+
+  // Backend rejected the session: the worker already removed the client
+  // token and stopped capture — drop in-memory auth here too so the
+  // subtitle window shows the sign-in gate (and menu) signed-out UI.
+  function expireSession() {
+    try {
+      const p = NS.userStore?.handleSessionExpired
+        ? NS.userStore.handleSessionExpired()
+        : NS.userStore?.signOut?.();
+      if (p && typeof p.catch === "function") p.catch(() => {});
+    } catch (e) {
+      // The storage sync from the worker covers this tab as well.
+    }
+  }
+
+  NS.onRuntimeMessage = function(message, sender, sendResponse) {
     if (S.isClosing) return;
     if (message?.type === "caption") {
       if (!NS.isSignedIn()) {
@@ -76,8 +90,26 @@
       }
       NS.revealForRecording();
       NS.updateStatusUI();
+    } else if (message?.type === "caption-ping") {
+      // Liveness probe from the service worker's navigation check:
+      // answering proves this overlay survived the navigation (SPA), so
+      // the worker re-shows instead of stopping the session. A full
+      // navigation has no listener left, and the send fails instead.
+      sendResponse?.({ ok: true, alive: true });
+      return;
     } else if (message?.type === "caption-status") {
+      // An expired/invalid token must sign out (gate + no retry), not
+      // show the Retry error — also covers builds that only send status.
+      if (
+        message?.status === "error" &&
+        /auth_expired|session expired|anonymous/i.test(message?.message || "")
+      ) {
+        expireSession();
+        return;
+      }
       NS.handleConnectionStatus(message);
+    } else if (message?.type === "session-expired") {
+      expireSession();
     } else if (message?.type === "quota-update") {
       // Live quota from the backend (opening state, periodic refresh,
       // final commit): apply to the user menu's remaining-minutes view.

@@ -155,7 +155,7 @@
 
           if (res?.needsConfirmation) {
             setAuthMode("signin");
-            errorLine.textContent = "Check your inbox to confirm your email, then sign in.";
+            errorLine.textContent = "Check your inbox to confirm your mail.";
             errorLine.hidden = false;
             return;
           }

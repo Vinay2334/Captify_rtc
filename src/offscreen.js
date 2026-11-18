@@ -340,6 +340,21 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   return false;
 });
 
+// The backend rejected this tab's token as expired/invalid. The worker
+// clears the client token, stops every capture, and tells each overlay to
+// sign out so the subtitle window falls back to the sign-in gate instead
+// of retrying with a dead token.
+function notifySessionExpired(session) {
+  try {
+    chrome.runtime.sendMessage({
+      type: "session-expired",
+      tabId: session?.tabId ?? null,
+    });
+  } catch (e) {
+    console.warn("Failed to broadcast session-expired:", e);
+  }
+}
+
 function broadcastCaption(session, text, itemId, isFinal) {
   try {
     chrome.runtime.sendMessage({
@@ -451,6 +466,9 @@ function handleServerMessage(session, raw) {
     ) {
       session.authTerminal = msg.code;
     }
+    if (msg.code === "auth_expired" || msg.code === "anonymous_disabled") {
+      notifySessionExpired(session);
+    }
     console.warn("Transcription server error:", msg.code, msg.message);
     notifyConnectionStatus(session, "error", {
       message:
@@ -550,12 +568,12 @@ function friendlyConnectError(e) {
     return detail.replace(/^quota_exceeded:\s*/, "");
   }
   if (/failed to fetch|networkerror|load failed/i.test(detail)) {
-    return "Couldn't reach the transcription server. Check that the backend is running, then retry.";
+    return "Couldn't reach the transcription server.";
   }
   if (/signaling failed/i.test(detail)) {
     return `Transcription server refused the connection (${detail}). Retry, or restart the backend.`;
   }
-  return "Connection to the transcription server failed. Retry when the backend is back.";
+  return "Connection to the transcription server failed.";
 }
 
 // A dropped mid-session transport (peer "failed", channel closed) heals
@@ -924,6 +942,7 @@ async function exchangeOffer(localDescription, session) {
     } catch (e) { /* non-JSON error page */ }
     if (res.status === 401 || code === "auth_expired" || code === "anonymous_disabled") {
       if (session) session.authTerminal = code === "anonymous_disabled" ? "anonymous_disabled" : "auth_expired";
+      notifySessionExpired(session);
       if (code === "anonymous_disabled") {
         throw new Error(
           "anonymous_disabled: Anonymous sign-in is disabled. Sign in with email or Google.",

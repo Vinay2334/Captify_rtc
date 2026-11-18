@@ -9,6 +9,11 @@ let data = [];
 // per tab (keyed by tabId) instead of one document per tab.
 const recordingTabs = new Set();
 
+// The overlay injects only here, on explicit user activation (toolbar
+// click, sign-in from the gate/menu): there is no manifest content_scripts
+// entry, so opening a page never loads Captify. The click gesture grants
+// activeTab, which covers this injection without any <all_urls> host
+// permission.
 async function ensureCaptionScript(tabId) {
   try {
     await chrome.scripting.executeScript({
@@ -38,11 +43,17 @@ async function ensureCaptionScript(tabId) {
     });
   } catch (e) {
     // Expected on chrome://, edge://, Chrome Web Store, etc. where content
-    // scripts can't run; the declarative content_scripts entry covers
-    // ordinary http(s) pages.
+    // scripts can't run; anywhere else this runs right after a user
+    // gesture, so activeTab covers the injection.
     console.warn("Caption script injection skipped:", e?.message || e);
   }
 }
+
+// Public pricing site (must match SITE_URL in both
+// caption-overlay/lib/supabase-config.js and website/site-config.js).
+// The overlay builds the upgrade URL with the account attached; the worker
+// opens it only when it stays on this origin.
+const SITE_URL = "http://localhost:8080";
 
 // Captify only works signed in. The overlay's user store persists its
 // state under this key (caption-overlay/lib/user-store.js); the worker is
@@ -66,6 +77,37 @@ async function getAccessToken() {
     return res?.captifySupabaseSession?.access_token || null;
   } catch (e) {
     return null;
+  }
+}
+
+// The backend rejected the session as expired/invalid: drop the client
+// token and the signed-out-pending user state so no new capture can start
+// with the dead token. Overlays watching storage fall back to the sign-in
+// gate; the explicit session-expired broadcast below clears their
+// in-memory auth too.
+async function clearExpiredClientSession() {
+  try {
+    await chrome.storage.local.remove([
+      "captifySupabaseSession",
+      "captifyUserState",
+    ]);
+  } catch (e) {
+    // Storage unavailable — overlays still sign out from the broadcast.
+  }
+}
+
+// Expired session: stop every capture like a sign-out (overlays stay up
+// showing the gate), then tell each overlay to drop its in-memory auth.
+async function handleSessionExpired(tabId) {
+  await clearExpiredClientSession();
+  await reconcileRecordingTabs();
+  const targets = new Set([...recordingTabs]);
+  if (tabId != null) targets.add(tabId);
+  for (const id of targets) {
+    if (recordingTabs.has(id)) {
+      await stopTabRecording(id, { teardownOverlay: false });
+    }
+    await sendToTab(id, { type: "session-expired", tabId: id });
   }
 }
 
@@ -258,12 +300,27 @@ chrome.tabs.onRemoved.addListener(async (tabId) => {
   await stopTabRecording(tabId);
 });
 
-// Re-inject the caption overlay if a recording tab navigates/reloads; the
-// audio session in the offscreen document keeps running.
+// A recording tab finished loading: without manifest auto-inject, the
+// overlay only still exists if the navigation kept the document (SPA).
+// Ping it: an answer means the overlay survived and just needs
+// re-showing; silence means the page (and its overlay) is gone, so stop
+// that tab's session instead of captioning a document that no longer
+// exists (and billing audio nobody watches).
 chrome.tabs.onUpdated.addListener(async (tabId, changeInfo) => {
   if (changeInfo.status === "complete" && recordingTabs.has(tabId)) {
-    await ensureCaptionScript(tabId);
-    await sendToTab(tabId, { type: "caption-show" });
+    let alive = false;
+    try {
+      await chrome.tabs.sendMessage(tabId, { type: "caption-ping" });
+      alive = true;
+    } catch (e) {
+      alive = false;
+    }
+    if (alive) {
+      await sendToTab(tabId, { type: "caption-show" });
+    } else {
+      console.log("tab navigated away, stopping recording for tab", tabId);
+      await stopTabRecording(tabId, { teardownOverlay: false });
+    }
   }
 });
 
@@ -312,7 +369,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
               tabId,
               status: "error",
               message:
-                "Couldn't start captions. Check that the backend is running, then retry.",
+                "Couldn't start captions.",
             });
           }
         }
@@ -323,7 +380,30 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         for (const id of [...recordingTabs]) {
           await stopTabRecording(id, { teardownOverlay: false });
         }
+      } else if (message.action === "upgrade") {
+        // Open pricing with the account attached (built by the overlay's
+        // user store). Only same-origin URLs go out — anything else is a
+        // broken config or a spoofed message, never a tab.
+        const url = message.url;
+        if (typeof url === "string" && url.startsWith(SITE_URL + "/")) {
+          try {
+            await chrome.tabs.create({ url });
+          } catch (e) {
+            console.warn("upgrade tab open failed:", e?.message || e);
+          }
+        } else {
+          console.warn("upgrade ignored: URL outside SITE_URL");
+        }
       }
+      sendResponse?.({ ok: true, handled: true });
+      return;
+    }
+    if (message.type === "session-expired") {
+      // The backend rejected the token (signaling 401 or an auth error
+      // over the DataChannel): remove it client-side, stop capture, and
+      // drive every overlay to the signed-out UI.
+      const tabId = message.tabId ?? sender?.tab?.id;
+      await handleSessionExpired(tabId);
       sendResponse?.({ ok: true, handled: true });
       return;
     }

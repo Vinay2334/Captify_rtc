@@ -17,6 +17,7 @@
     if (!S.authSignedIn) {
       S.modeDropdown?.close();
       S.targetDropdown?.close();
+      S.userMenu?.close();
       NS.clearWatchdog();
       if (S.body) S.body.innerHTML = "";
       S.currentLine = null;
@@ -80,7 +81,7 @@
       if (S.connStatus === "connected" || S.connStatus === "error") return;
       S.connStatus = "error";
       S.connMessage =
-        "Couldn't reach the transcription server. Check that the backend is running, then retry.";
+        "Couldn't reach the transcription server.";
       S.connAttempt = null;
       S.connMaxAttempts = null;
       S.buffering = false;
