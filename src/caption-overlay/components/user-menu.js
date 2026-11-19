@@ -88,10 +88,13 @@
       );
       planRow.append(planText, ui.badge(s.plan.name, "outline"));
       popup.appendChild(planRow);
-      if (s.plan.name !== NS.userStore.getProPlan().name) {
+      // Upgrade points at the plan one step above the current one in
+      // catalog order (hidden on the top plan): Free -> Pro -> Studio.
+      const target = userStore.getUpgradeTarget?.(s.plan.name) ?? null;
+      if (target) {
         const upgrade = ui.el("div", "um-stack");
         upgrade.appendChild(ui.button({
-          variant: "default", label: "Upgrade to Pro", icon: icons.zap,
+          variant: "default", label: `Upgrade to ${target.name}`, icon: icons.zap,
           onClick: () => userStore.upgrade(),
         }));
         popup.appendChild(upgrade);
@@ -111,8 +114,11 @@
         render();
         // Pull the live plan + quota (a dashboard plan change or a
         // just-finished session shows up the next time the menu opens).
+        // The catalog refresh re-renders through the store subscription
+        // once the upgrade target resolves.
         try {
           userStore.refreshQuota?.()?.catch?.(() => {});
+          userStore.refreshPlans?.()?.catch?.(() => {});
         } catch (e) { /* stale numbers stay until the next open */ }
       }
     }

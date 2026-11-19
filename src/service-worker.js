@@ -344,6 +344,42 @@ async function openSigninPage(tabId) {
   }
 }
 
+// Overlay backend reads (quota display, plan catalog). Content-script
+// fetches run under the page's origin, so on public sites Private/Local
+// Network Access blocks loopback outright (the page gets a CORS error for
+// quota AND plans). The worker fetches with host permissions instead (no
+// page origin, no preflight block); auth stays with the overlay (it owns
+// the token and passes it as a header, same as its direct fetches did).
+// Only backend-API URLs go out (mirrors the upgrade allow-list below) —
+// keep OVERLAY_API_PREFIX in sync with BACKEND_BASE_URL in
+// caption-overlay/lib/supabase-config.js.
+const OVERLAY_API_PREFIX = "http://127.0.0.1:8000/api/";
+
+async function fetchForOverlay(url, headers) {
+  if (typeof url !== "string" || !url.startsWith(OVERLAY_API_PREFIX)) {
+    return { status: 0, ok: false, body: null, reason: "blocked_url" };
+  }
+  try {
+    const res = await fetch(url, { headers: headers || {} });
+    let body = null;
+    try { body = await res.json(); } catch (e) { /* non-JSON */ }
+    return { status: res.status, ok: res.ok, body };
+  } catch (e) {
+    return { status: 0, ok: false, body: null, reason: "backend_unreachable" };
+  }
+}
+
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message && message.type === "captify-overlay-data") {
+    fetchForOverlay(message.url, message.headers).then(
+      (result) => { try { sendResponse?.({ ok: true, ...result }); } catch (e) {} },
+      () => { try { sendResponse?.({ ok: false, status: 0, body: null }); } catch (e) {} },
+    );
+    return true; // async reply: keep the channel open
+  }
+  return false;
+});
+
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   (async () => {
     if (message.type === "open-signin") {

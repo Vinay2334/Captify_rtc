@@ -105,8 +105,68 @@
         ? { ...state.plan, name: String(snap.plan) }
         : state.plan,
     };
+    // A new name with another plan's facts (price/tagline) must not
+    // linger: re-enrich from the cached catalog when one is loaded.
+    enrichPlanFromCatalog();
     persist();
     emit();
+  }
+
+  // Backend reads go through the service worker first. Content-script
+  // fetches run under the page's origin, so on public sites Private/Local
+  // Network Access blocks loopback outright (quota AND plans fail with a
+  // CORS error). The worker fetches with host permissions instead (no
+  // page origin, no preflight block). Falls back to a direct fetch when
+  // no worker answers (plain-node tests, popup mid-restart, old workers).
+  // Either path resolves to { status, ok, body } (never throws).
+  async function fetchJson(url, headers) {
+    let viaWorker = null;
+    try {
+      viaWorker = await workerFetchJson(url, headers);
+    } catch (e) {
+      viaWorker = null; // exotic context (no timers): direct fallback
+    }
+    if (viaWorker) return viaWorker;
+    try {
+      const res = await fetch(url, headers ? { headers } : undefined);
+      let body = null;
+      try { body = await res.json(); } catch (e) { /* non-JSON */ }
+      return { status: res.status, ok: res.ok, body };
+    } catch (e) {
+      return { status: 0, ok: false, body: null };
+    }
+  }
+
+  function workerFetchJson(url, headers) {
+    try {
+      if (!chrome.runtime?.sendMessage) return Promise.resolve(null);
+      const request = (async () => {
+        try {
+          const res = await chrome.runtime.sendMessage({
+            type: "captify-overlay-data",
+            url,
+            headers: headers || {},
+          });
+          // A bare { ok } ack (other listeners, old workers) is not data.
+          if (!res || typeof res !== "object" || res.status === undefined || res.ok === undefined) {
+            return null;
+          }
+          return res;
+        } catch (e) {
+          return null; // no receiving end (worker dead): direct fallback
+        }
+      })();
+      // A listener that never answers must not hang the menu: fall back.
+      let timer = null;
+      const timeout = new Promise((resolve) => {
+        timer = setTimeout(() => resolve(null), 8000);
+      });
+      return Promise.race([request, timeout]).finally(() => {
+        if (timer) clearTimeout(timer);
+      });
+    } catch (e) {
+      return Promise.resolve(null);
+    }
   }
 
   async function fetchQuota() {
@@ -136,16 +196,15 @@
     }
     const url = NS.captifyConfig?.quotaUrl?.();
     if (!url) return null;
-    const res = await fetch(url, {
-      headers: { Authorization: `Bearer ${token}` },
-    });
+    const res = await fetchJson(url, { Authorization: `Bearer ${token}` });
     if (res.status === 401) {
       // Token died between restore and use: drop to signed-out.
       await NS.userStore.signOut();
       throw new Error("Session expired. Please sign in again.");
     }
     if (!res.ok) throw new Error(`Quota request failed (${res.status})`);
-    const snap = await res.json();
+    const snap = res.body;
+    if (!snap) throw new Error("Quota request failed (bad_response)");
     if (snap?.email && state.user) {
       state = {
         ...state,
@@ -154,6 +213,74 @@
     }
     applyQuotaSnapshot(snap);
     return snap;
+  }
+
+  // Live plan catalog (GET /api/v1/plans): the single source of truth for
+  // plan order. Cached in memory, cheapest first; the upgrade button
+  // derives "one above current" from it so a new plan needs no extension
+  // change. Null until the first successful fetch.
+  let planCatalog = null;
+
+  function sortCatalog(plans) {
+    return [...plans].sort(
+      (a, b) =>
+        Number(a.display_order ?? 0) - Number(b.display_order ?? 0) ||
+        Number(a.price_monthly_usd ?? 0) - Number(b.price_monthly_usd ?? 0) ||
+        (String(a.id ?? a.name ?? "") < String(b.id ?? b.name ?? "") ? -1 : 1),
+    );
+  }
+
+  async function fetchPlanCatalog() {
+    const url = NS.captifyConfig?.plansUrl?.();
+    if (!url) return null;
+    // fetchJson never throws: unreachable/blocked backends resolve
+    // { ok: false } and the menu keeps the legacy fallback.
+    const res = await fetchJson(url);
+    if (!res?.ok) return null; // billing disabled answers 503: same fallback
+    const rows = Array.isArray(res.body?.plans) ? res.body.plans : null;
+    if (!rows) return null;
+    planCatalog = sortCatalog(rows.filter((p) => p && (p.id || p.name)));
+    // Quota snapshots only carry the plan name: enrich the displayed
+    // price/tagline from the same rows the pricing page renders.
+    if (enrichPlanFromCatalog()) {
+      persist();
+      emit();
+    }
+    return planCatalog;
+  }
+
+  // Patch the displayed price/tagline for the current plan name from the
+  // cached catalog. Runs after every plan-name change (quota snapshot,
+  // catalog fetch) so the menu never shows another plan's facts.
+  // Returns true when anything changed.
+  function enrichPlanFromCatalog() {
+    if (!planCatalog) return false;
+    const current = planCatalog.find((p) => p.name === state.plan.name);
+    if (!current) return false;
+    const priceLabel = current.price_label || state.plan.priceLabel;
+    const tagline = current.tagline || state.plan.tagline;
+    if (priceLabel === state.plan.priceLabel && tagline === state.plan.tagline) return false;
+    state = { ...state, plan: { ...state.plan, priceLabel, tagline } };
+    return true;
+  }
+
+  // The plan one step above `planName` in catalog order ({ name }), or
+  // null when already on the top plan (the menu hides the button then).
+  // Unknown current plan: offer the cheapest paid plan (parallels the
+  // pricing page, where every paid plan is an upgrade from unknown).
+  // No catalog yet: legacy fallback — Pro for everyone not already on
+  // it, exactly like before.
+  function upgradeTargetFor(planName, catalog = planCatalog) {
+    if (!catalog?.length) {
+      return planName === PRO_PLAN.name ? null : { ...PRO_PLAN };
+    }
+    const idx = catalog.findIndex((p) => p?.name === planName);
+    if (idx === -1) {
+      const paid = catalog.filter((p) => Number(p.price_monthly_usd || 0) > 0);
+      return paid.length ? { name: String(paid[0].name) } : null;
+    }
+    const next = catalog[idx + 1];
+    return next ? { name: String(next.name) } : null;
   }
 
   let watchingStorage = false;
@@ -216,6 +343,7 @@
     persist();
     emit();
     try { await fetchQuota(); } catch (e) { /* overlay still works; quota retries on open */ }
+    try { await fetchPlanCatalog(); } catch (e) { /* menu retries on open */ }
     return structuredClone(state);
   }
 
@@ -243,6 +371,7 @@
     load,
     restore,
     refreshQuota: fetchQuota,
+    refreshPlans: fetchPlanCatalog,
     applyQuota: (snap) => applyQuotaSnapshot(snap),
     async signInWithPassword(email, password) {
       const { user } = await NS.supabaseAuth.signInWithPassword(email, password);
@@ -289,6 +418,10 @@
       notifyBackend("upgrade", url ? { url } : undefined);
     },
     getProPlan: () => ({ ...PRO_PLAN }),
+    // The upgrade button label's plan ({ name }) or null when the menu
+    // should show no upgrade button (already on the top plan).
+    getUpgradeTarget: (planName) =>
+      upgradeTargetFor(planName ?? NS.userStore.getState().plan.name),
     // Minutes shown in the menu (billing stays in seconds server-side).
     quotaMinutes(s = state) {
       const used = Math.floor((s.quota.usedSeconds || 0) / 60);

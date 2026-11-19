@@ -53,7 +53,7 @@ function loadPage({ search = "?tabId=7", signupNeedsConfirm = false } = {}) {
   const stored = {};
   let closed = false;
   const context = vm.createContext({
-    structuredClone, console,
+    structuredClone, console, setTimeout, clearTimeout,
     location: { search },
     window: { close: () => { closed = true; } },
     document: {

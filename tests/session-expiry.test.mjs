@@ -13,6 +13,11 @@ const SUPA_USER = {
   user_metadata: { first_name: "Ada", last_name: "Lovelace" },
 };
 
+// Relay traffic (captify-overlay-data) is internal: the stub records the
+// worker-bound request in `sent`, but it is not a menu action.
+const menuActions = (sent) =>
+  sent.filter((m) => m && m.type === "captify-menu-action").map((m) => m.action);
+
 function loadExpiredHarness({ quotaStatus = 200, userStatus = 200, refreshStatus = 200, shared } = {}) {
   const sent = [];
   const stored = shared || {};
@@ -58,6 +63,8 @@ function loadExpiredHarness({ quotaStatus = 200, userStatus = 200, refreshStatus
     window,
     structuredClone,
     console,
+    setTimeout,
+    clearTimeout,
     fetch: async (url, opts = {}) => {
       const u = String(url);
       const ok = (data) => ({ ok: true, status: 200, json: async () => data });
@@ -122,7 +129,7 @@ test("expired refresh clears the client token and signs the overlay out", async 
   const s = store.getState();
   assert.equal(s.signedIn, false);
   assert.equal(s.user, null);
-  assert.deepEqual(sent.map((m) => m.action), ["sign-in", "sign-out"]);
+  assert.deepEqual(menuActions(sent), ["sign-in", "sign-out"]);
 });
 
 test("transient refresh failure keeps the session and stays signed in", async () => {
@@ -139,7 +146,7 @@ test("transient refresh failure keeps the session and stays signed in", async ()
 
   assert.ok(stored.captifySupabaseSession);
   assert.equal(store.getState().signedIn, true);
-  assert.deepEqual(sent.map((m) => m.action), ["sign-in"]);
+  assert.deepEqual(menuActions(sent), ["sign-in"]);
 });
 
 test("popup sign-in heals a stale overlay instead of signing it out", async () => {
@@ -177,7 +184,7 @@ test("popup sign-in heals a stale overlay instead of signing it out", async () =
   await tab.store.refreshQuota();
   assert.equal(tab.store.getState().signedIn, true);
   assert.equal(tab.store.getState().quota.usedSeconds, 120);
-  assert.deepEqual(tab.sent.map((m) => m.action), []);
+  assert.deepEqual(menuActions(tab.sent), []);
 });
 
 test("quota 401 signs out and drops the client token", async () => {
@@ -187,7 +194,7 @@ test("quota 401 signs out and drops the client token", async () => {
   await assert.rejects(store.signInWithPassword("ada@captify.local", "secret"), /Session expired/);
   assert.equal(stored.captifySupabaseSession, undefined);
   assert.equal(store.getState().signedIn, false);
-  assert.deepEqual(sent.map((m) => m.action), ["sign-in", "sign-out"]);
+  assert.deepEqual(menuActions(sent), ["sign-in", "sign-out"]);
 });
 
 test("restore with a dead session signs out instead of staying unlocked", async () => {

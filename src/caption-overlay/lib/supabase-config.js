@@ -24,6 +24,10 @@
     return `${NS.captifyConfig.BACKEND_BASE_URL.replace(/\/$/, "")}/api/v1/me/quota`;
   };
 
+  NS.captifyConfig.plansUrl = function () {
+    return `${NS.captifyConfig.BACKEND_BASE_URL.replace(/\/$/, "")}/api/v1/plans`;
+  };
+
   // Hand-rolled query encoding: classic scripts avoid URLSearchParams so
   // they run in bare-vm tests as well as extension contexts.
   NS.captifyConfig.pricingUrl = function (email, userId) {

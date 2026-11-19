@@ -74,7 +74,7 @@ function loadGate() {
   const document = { createElement: (tag) => new FakeEl(tag) };
   const sent = [];
   const context = vm.createContext({
-    window, document, structuredClone, console, fetch: stubFetch,
+    window, document, structuredClone, console, setTimeout, clearTimeout, fetch: stubFetch,
     chrome: {
       storage: { local: { get: (k, cb) => cb({}), set: () => {} } },
       runtime: { sendMessage: (msg) => { sent.push(msg); } },
