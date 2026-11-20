@@ -170,6 +170,9 @@
   }
 
   async function fetchQuota() {
+    // Pick up a moved backend before building the URL (cheap storage read;
+    // baked-in defaults stand when nothing cached yet).
+    try { await NS.captifyConfig?.loadRemoteConfig?.(); } catch (e) {}
     let token = await NS.supabaseAuth?.getAccessToken?.();
     // Snapshot before the reload below: a concurrent expiry sign-out may
     // flip state while we re-read storage, and the throw must not depend
@@ -231,6 +234,7 @@
   }
 
   async function fetchPlanCatalog() {
+    try { await NS.captifyConfig?.loadRemoteConfig?.(); } catch (e) {}
     const url = NS.captifyConfig?.plansUrl?.();
     if (!url) return null;
     // fetchJson never throws: unreachable/blocked backends resolve
@@ -318,6 +322,7 @@
   }
 
   async function restore() {
+    try { await NS.captifyConfig?.loadRemoteConfig?.(); } catch (e) {}
     const supa = await NS.supabaseAuth?.load?.();
     if (!supa) {
       // No Supabase session but a stale signed-in flag: sign out cleanly

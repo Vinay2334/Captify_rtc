@@ -39,6 +39,12 @@ function copyExtensionAssets() {
         resolve(srcDir, "content-script.js"),
         resolve(outDir, "content-script.js")
       );
+      // Packaged remote-config fallback: the extension reads this copy when
+      // the hosted config is unreachable (offline first run, blocked host).
+      copyFileSync(
+        resolve(projectRoot, "remote-config/extension-config.json"),
+        resolve(outDir, "extension-config.json")
+      );
       // Same for the caption-overlay modules (hamburger / user menu):
       // classic scripts loaded in order before content-script.js.
       cpSync(resolve(srcDir, "caption-overlay"), resolve(outDir, "caption-overlay"), {

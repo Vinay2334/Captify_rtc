@@ -81,6 +81,7 @@ body {
   display: inline-flex;
   align-items: center;
   justify-content: center;
+  gap: 8px;
   height: 38px;
   padding: 0 16px;
   border-radius: 8px;
@@ -111,6 +112,11 @@ body {
 }
 .signin-btn-secondary:hover {
   background: rgba(255, 255, 255, 0.18);
+}
+.signin-google-icon {
+  width: 18px;
+  height: 18px;
+  flex: none;
 }
 .signin-btn-ghost {
   background: transparent;

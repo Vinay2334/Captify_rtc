@@ -1,3 +1,9 @@
+import {
+  loadRemoteConfig,
+  resolveOverlayApiPrefix,
+  resolveSiteUrl,
+} from "./remote-config.mjs";
+
 let data = [];
 
 // Tabs currently being captioned. Captions flow offscreen -> service worker
@@ -355,8 +361,52 @@ async function openSigninPage(tabId) {
 // caption-overlay/lib/supabase-config.js.
 const OVERLAY_API_PREFIX = "http://127.0.0.1:8000/api/";
 
+// Over-the-air backend/redirect URLs (see src/remote-config.mjs). The
+// storage cache holds the last validated hosted document; the packaged
+// remote-config/extension-config.json copy covers offline first runs.
+let cachedRemoteConfig = null;
+
+async function getRemoteConfig() {
+  if (cachedRemoteConfig) return cachedRemoteConfig;
+  try {
+    cachedRemoteConfig = await loadRemoteConfig();
+  } catch (e) {
+    cachedRemoteConfig = null;
+  }
+  return cachedRemoteConfig;
+}
+
+// Refresh the cache in the background on every worker start (workers restart
+// often, so this stays fresh without slowing any message handler).
+loadRemoteConfig({ refresh: true })
+  .then((config) => {
+    if (config) cachedRemoteConfig = config;
+  })
+  .catch(() => {});
+
+// Allow-listed API prefixes: the baked-in prefix plus the validated remote
+// one. Both are data from reviewed sources, never code.
+async function allowedApiPrefixes() {
+  const prefixes = [OVERLAY_API_PREFIX];
+  const remote = resolveOverlayApiPrefix(await getRemoteConfig(), OVERLAY_API_PREFIX);
+  if (!prefixes.includes(remote)) prefixes.push(remote);
+  return prefixes;
+}
+
+// Same pair for the pricing-site origin guard on upgrade URLs.
+async function allowedSiteUrls() {
+  const sites = [SITE_URL];
+  const remote = resolveSiteUrl(await getRemoteConfig(), SITE_URL);
+  if (!sites.includes(remote)) sites.push(remote);
+  return sites;
+}
+
 async function fetchForOverlay(url, headers) {
-  if (typeof url !== "string" || !url.startsWith(OVERLAY_API_PREFIX)) {
+  const prefixes = await allowedApiPrefixes();
+  if (
+    typeof url !== "string" ||
+    !prefixes.some((prefix) => url.startsWith(prefix))
+  ) {
     return { status: 0, ok: false, body: null, reason: "blocked_url" };
   }
   try {
@@ -421,7 +471,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         // user store). Only same-origin URLs go out — anything else is a
         // broken config or a spoofed message, never a tab.
         const url = message.url;
-        if (typeof url === "string" && url.startsWith(SITE_URL + "/")) {
+        const sites = await allowedSiteUrls();
+        if (
+          typeof url === "string" &&
+          sites.some((base) => url.startsWith(base + "/"))
+        ) {
           try {
             await chrome.tabs.create({ url });
           } catch (e) {

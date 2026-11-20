@@ -43,4 +43,55 @@
       !NS.captifyConfig.SUPABASE_URL.includes("YOUR-PROJECT")
     );
   };
+
+  // Over-the-air overrides from the hosted config document. The service
+  // worker fetches and validates the document into chrome.storage.local
+  // (key below must match REMOTE_CONFIG_STORAGE_KEY in src/remote-config.mjs);
+  // the overlay applies the cached copy here before building backend URLs.
+  // Same rule as the module validator: https: URLs, http: loopback only,
+  // unknown fields ignored, never throws.
+  NS.captifyConfig.applyRemoteConfig = function (obj) {
+    if (!obj || typeof obj !== "object" || Array.isArray(obj)) return false;
+    let changed = false;
+    const setUrl = (key, value) => {
+      if (typeof value !== "string" || !value) return;
+      let url;
+      try {
+        url = new URL(value);
+      } catch (e) {
+        return;
+      }
+      const host = String(url.hostname || "").toLowerCase();
+      const loopback =
+        host === "localhost" ||
+        host === "127.0.0.1" ||
+        host === "[::1]" ||
+        host === "::1" ||
+        host.indexOf("127.") === 0;
+      if (url.protocol !== "https:" && !(url.protocol === "http:" && loopback)) {
+        return;
+      }
+      NS.captifyConfig[key] = value;
+      changed = true;
+    };
+    setUrl("BACKEND_BASE_URL", obj.backend_base_url);
+    setUrl("SITE_URL", obj.site_url);
+    setUrl("SUPABASE_URL", obj.supabase_url);
+    if (typeof obj.supabase_anon_key === "string" && obj.supabase_anon_key) {
+      NS.captifyConfig.SUPABASE_ANON_KEY = obj.supabase_anon_key;
+      changed = true;
+    }
+    return changed;
+  };
+
+  // Reads the service worker's validated cache. False means "keep the
+  // baked-in defaults" (offline, or no fetch has landed yet).
+  NS.captifyConfig.loadRemoteConfig = async function () {
+    try {
+      const res = await chrome.storage?.local?.get("captifyRemoteConfig");
+      return NS.captifyConfig.applyRemoteConfig(res?.captifyRemoteConfig);
+    } catch (e) {
+      return false;
+    }
+  };
 })();

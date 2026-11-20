@@ -15,6 +15,12 @@
 
 import { RTC_CONFIG } from "./rtc-config.js";
 import {
+  loadRemoteConfig,
+  resolveDataChannelLabel,
+  resolveIceServers,
+  resolveSignalUrl,
+} from "./remote-config.mjs";
+import {
   CHANNEL_OPEN_TIMEOUT_MS,
   MAX_CONNECT_ATTEMPTS,
   SIGNAL_TIMEOUT_MS,
@@ -31,6 +37,29 @@ const PRE_ROLL_CHUNKS = 2;
 const assetBase = chrome.runtime.getURL("vad-assets/");
 
 const sessions = new Map();
+
+// Over-the-air transport config (signal URL, ICE servers, channel label).
+// The first session start uses the storage cache or packaged fallback (both
+// local, so no extra latency); a background refresh keeps the cache fresh
+// for later sessions.
+let cachedRemoteConfig = undefined; // undefined = not loaded yet
+
+async function getRemoteConfig() {
+  if (cachedRemoteConfig === undefined) {
+    try {
+      cachedRemoteConfig = await loadRemoteConfig();
+    } catch (e) {
+      cachedRemoteConfig = null;
+    }
+  }
+  return cachedRemoteConfig;
+}
+
+loadRemoteConfig({ refresh: true })
+  .then((config) => {
+    if (config) cachedRemoteConfig = config;
+  })
+  .catch(() => {});
 
 // One AudioContext shared by every tab's recorder chain
 // (MediaStreamSource -> "recorder-processor" AudioWorkletNode). Previously
@@ -791,8 +820,13 @@ async function startRecording(tabId, streamId, opts = {}) {
 }
 
 async function setupPeerConnection(session) {
-  const iceServers = RTC_CONFIG.ICE_SERVERS || [];
-  const label = RTC_CONFIG.DATA_CHANNEL_LABEL || "audio";
+  const remote = await getRemoteConfig();
+  const iceServers = resolveIceServers(remote, RTC_CONFIG.ICE_SERVERS || []);
+  const label = resolveDataChannelLabel(
+    remote,
+    RTC_CONFIG.DATA_CHANNEL_LABEL || "audio",
+  );
+  session.signalUrl = resolveSignalUrl(remote, RTC_CONFIG.SIGNAL_URL);
   session.peerConnection = new RTCPeerConnection({ iceServers });
   session.audioChannel = session.peerConnection.createDataChannel(label, {
     ordered: true,
@@ -912,7 +946,7 @@ function waitForIceGatheringComplete(pc) {
 }
 
 async function exchangeOffer(localDescription, session) {
-  const signalUrl = RTC_CONFIG.SIGNAL_URL;
+  const signalUrl = session?.signalUrl || RTC_CONFIG.SIGNAL_URL;
   console.log("Sending offer to signaling server:", signalUrl);
   const headers = { "Content-Type": "application/json" };
   // The user's own access token; verified backend-side (service_role key

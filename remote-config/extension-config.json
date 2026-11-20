@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "updated_at": "2026-11-19T00:00:00.000Z",
+  "backend_base_url": "https://130.210.75.41.sslip.io",
+  "signal_url": "https://130.210.75.41.sslip.io/api/v1/transcription/webrtc/offer",
+  "overlay_api_prefix": "https://130.210.75.41.sslip.io/api/",
+  "site_url": "https://captifylanding.netlify.app/",
+  "supabase_url": "https://hsuuleiisdgbidbwkqae.supabase.co",
+  "supabase_anon_key": "sb_publishable_namQsShONsZJviiyWtulnA_wZ4NWUPW",
+  "ice_servers": [],
+  "data_channel_label": "audio"
+}
