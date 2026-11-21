@@ -17,6 +17,7 @@
     }
 
     S.modeDropdown?.close();
+    S.modelTierDropdown?.close();
     S.targetDropdown?.close();
     S.userMenu?.close();
     S.container?.classList.remove("is-visible");
@@ -108,6 +109,7 @@
     S.signInGate = null;
     S.unsubscribeAuth = null;
     S.modeDropdown = null;
+    S.modelTierDropdown = null;
     S.targetDropdown = null;
     S.resizeObserver = null;
     S.onWindowPointerDown = null;
@@ -141,6 +143,7 @@
     `;
 
     S.modeDropdown = NS.makeDropdown(C.MODES, "transcription", "Mode", NS.sendConfig, false);
+    S.modelTierDropdown = NS.makeDropdown(C.MODEL_TIERS, "base", "Model", NS.sendConfig, false);
     S.targetDropdown = NS.makeDropdown(C.LANGUAGES, "en", "Translate to", NS.sendConfig);
     NS.updateTargetVisibility();
     // Announce the defaults so the backend starts in the shown mode
@@ -174,6 +177,7 @@
           S.container?.classList.toggle("user-menu-open", open);
           if (open) {
             S.modeDropdown?.close();
+            S.modelTierDropdown?.close();
             S.targetDropdown?.close();
           }
         },
@@ -182,6 +186,7 @@
 
     S.header.appendChild(grip);
     S.header.appendChild(S.modeDropdown.el);
+    S.header.appendChild(S.modelTierDropdown.el);
     S.header.appendChild(S.targetDropdown.el);
     S.header.appendChild(divider);
     if (S.userMenu) S.header.appendChild(S.userMenu.button);
@@ -233,6 +238,7 @@
     S.onWindowPointerDown = (e) => {
       if (S.host && !S.host.contains(e.target)) {
         S.modeDropdown.close();
+        S.modelTierDropdown.close();
         S.targetDropdown.close();
         S.userMenu?.close();
       }
@@ -242,6 +248,7 @@
     S.shadow.addEventListener("pointerdown", (e) => {
       if (!e.target.closest(".dd-field")) {
         S.modeDropdown.close();
+        S.modelTierDropdown.close();
         S.targetDropdown.close();
       }
       if (!e.target.closest(".captify-user-menu, .captify-hamburger-btn")) {
@@ -347,6 +354,7 @@
           didDrag = true;
           pinCurrentPosition();
           S.modeDropdown.close();
+          S.modelTierDropdown.close();
           S.targetDropdown.close();
           S.container.classList.add("is-dragging");
           try {

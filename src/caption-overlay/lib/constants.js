@@ -35,6 +35,11 @@
     ["transcription", "Transcription"],
   ],
 
+  MODEL_TIERS: [
+    ["base", "Base"],
+    ["pro", "Pro"],
+  ],
+
   CONNECT_WATCHDOG_MS: 20000,
   };
 })();

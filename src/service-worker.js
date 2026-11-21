@@ -574,6 +574,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             tabId,
             mode: message.mode,
             targetLang: message.target,
+            modelTier: message.modelTier,
           });
         } catch (e) {
           console.warn("caption-language delivery failed:", e?.message || e);

@@ -16,6 +16,7 @@
     S.container.classList.toggle("is-signed-out", !S.authSignedIn);
     if (!S.authSignedIn) {
       S.modeDropdown?.close();
+      S.modelTierDropdown?.close();
       S.targetDropdown?.close();
       S.userMenu?.close();
       NS.clearWatchdog();
@@ -42,7 +43,7 @@
   }
 
   NS.sendConfig = function() {
-    if (!S.modeDropdown || !S.targetDropdown || S.isClosing) return;
+    if (!S.modeDropdown || !S.modelTierDropdown || !S.targetDropdown || S.isClosing) return;
     NS.updateTargetVisibility();
     if (!NS.isSignedIn()) return;
     const mode = S.modeDropdown.getValue();
@@ -51,6 +52,7 @@
         type: "caption-language",
         mode,
         target: mode === "translation" ? S.targetDropdown.getValue() : null,
+        modelTier: S.modelTierDropdown.getValue(),
       });
     } catch (e) {
       // Extension context gone (e.g. during unload); selection is best-effort.

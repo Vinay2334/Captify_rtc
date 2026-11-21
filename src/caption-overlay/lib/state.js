@@ -9,7 +9,7 @@
   if (NS.state) return;
   NS.state = {
     host: null, shadow: null, container: null, headerWrap: null, header: null,
-    body: null, resizeObserver: null, modeDropdown: null, targetDropdown: null,
+    body: null, resizeObserver: null, modeDropdown: null, modelTierDropdown: null, targetDropdown: null,
     currentLine: null, currentItemId: null, visible: false, isClosing: false,
     hideTimeout: null, paused: false, buffering: true, statusBar: null,
     playBtn: null, retryBtn: null, statusText: null, statusDot: null,

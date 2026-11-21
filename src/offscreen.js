@@ -137,9 +137,15 @@ function createSession(tabId) {
     currentItemId: null, // now holds the active segKey
     currentText: "",
     connectionPromise: null,
-    // Mode/target picked in the tab's subtitle window. Sent to the backend
-    // over the DataChannel (see sendLangConfig).
+    // Mode/target/tier picked in the tab's subtitle window. Sent to the
+    // backend over the DataChannel (see sendLangConfig); the tier also
+    // selects the upstream transcription engine at signaling time.
     langConfig: null,
+    // Transcription tier ("base" Soniox / "pro" gpt-live-transcribe).
+    // Sent on the offer (initial engine) and with every language-config;
+    // the backend switches engines on the fly when it changes.
+    // Defaults to base.
+    modelTier: null,
     // Control payloads queued while the DataChannel is not open yet.
     pendingControl: [],
     // Connection lifecycle for the overlay's error/retry UI. While
@@ -200,9 +206,17 @@ const pendingLangConfig = new Map();
 // when the session is created so an early pause still takes effect.
 const pendingPaused = new Map();
 
+function normalizeModelTier(value) {
+  const tier = String(value || "").trim().toLowerCase();
+  return tier === "base" || tier === "pro" ? tier : null;
+}
+
 function langPayload(config) {
   // Source language is never sent: the backend model auto-detects it.
   // Target is only meaningful (and only sent) in translation mode.
+  // model_tier names the transcription engine (base Soniox / pro
+  // gpt-live-transcribe) on every request; the backend switches engines
+  // on the fly when it changes, so the transport is never torn down.
   const payload = {
     type: "language-config",
     mode: config.mode || "translation",
@@ -210,6 +224,8 @@ function langPayload(config) {
   if (payload.mode === "translation") {
     payload.target_lang = config.target || "en";
   }
+  const tier = normalizeModelTier(config.modelTier);
+  if (tier) payload.model_tier = tier;
   return JSON.stringify(payload);
 }
 
@@ -240,10 +256,14 @@ function sendLangConfig(session) {
 function applyLangConfig(tabId, config) {
   pendingLangConfig.set(tabId, config);
   const session = sessions.get(tabId);
-  if (session) {
-    session.langConfig = config;
-    sendLangConfig(session);
-  }
+  if (!session) return;
+  // The tier names the transcription engine per request; the backend
+  // switches engines on the fly when it changes, so the transport stays
+  // up and no re-offer is ever needed here.
+  const tier = normalizeModelTier(config.modelTier);
+  if (tier) session.modelTier = tier;
+  session.langConfig = config;
+  sendLangConfig(session);
 }
 
 async function applyPaused(tabId, paused) {
@@ -331,6 +351,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           applyLangConfig(message.tabId, {
             mode: message.mode || "translation",
             target: message.targetLang || "en",
+            modelTier: message.modelTier || "base",
           });
           break;
         case "pause-recording":
@@ -680,7 +701,12 @@ async function startRecording(tabId, streamId, opts = {}) {
   session.authTerminal = null;
   // Picks announced before this session existed (content-script defaults).
   const knownLang = pendingLangConfig.get(tabId);
-  if (knownLang) session.langConfig = knownLang;
+  if (knownLang) {
+    session.langConfig = knownLang;
+    const tier = normalizeModelTier(knownLang.modelTier);
+    if (tier) session.modelTier = tier;
+  }
+  if (!session.modelTier) session.modelTier = "base";
   if (pendingPaused.get(tabId) === true) session.paused = true;
 
   // Set up the peer connection FIRST, before any audio await, mirroring how
@@ -963,6 +989,7 @@ async function exchangeOffer(localDescription, session) {
       sdp: localDescription.sdp,
       type: localDescription.type,
       client_session_id: session?.clientSessionId || undefined,
+      model_tier: normalizeModelTier(session?.modelTier) || "base",
     }),
     signal: AbortSignal.timeout(SIGNAL_TIMEOUT_MS),
   });
