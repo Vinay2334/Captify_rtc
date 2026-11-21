@@ -3,21 +3,27 @@
 // (tab capture -> AudioContext -> AudioWorklet downsample to 24 kHz Int16,
 // 200 ms chunks). Only the transport changed: WebSocket.send was replaced
 // by RTCDataChannel.send over the RTCPeerConnection below.
+//
+// Transport defaults come from DEFAULT_CONFIG in remote-config.mjs (single
+// source of truth); only the audio-chain constants stay local here.
+
+import { DEFAULT_CONFIG } from "./remote-config.mjs";
 
 export const RTC_CONFIG = {
   // Backend endpoint that exchanges an SDP offer for an SDP answer.
   // Request:  POST { sdp: string, type: "offer" } as JSON.
   // Response: { sdp: string, type: "answer" } as JSON.
   // Non-trickle ICE is used, so the offer already contains all candidates.
-  SIGNAL_URL: "http://127.0.0.1:8000/api/v1/transcription/webrtc/offer",
+  SIGNAL_URL: DEFAULT_CONFIG.signal_url,
 
   // STUN/TURN servers for the RTCPeerConnection. Add a TURN entry here if
   // the backend is not on the same host/NAT as the browser.
-  ICE_SERVERS: [],
+  // (Copied: the remote document may supply its own list instead.)
+  ICE_SERVERS: [...DEFAULT_CONFIG.ice_servers],
   // ICE_SERVERS: [{ urls: "stun:stun.l.google.com:19302" }],
 
   // Reliable + ordered channel, matching the old WebSocket/TCP semantics.
-  DATA_CHANNEL_LABEL: "audio",
+  DATA_CHANNEL_LABEL: DEFAULT_CONFIG.data_channel_label,
 
   // Must match recorder-processor.js: 24000 Hz, 200 ms => 4800 samples.
   TARGET_SAMPLE_RATE: 24000,

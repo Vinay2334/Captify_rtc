@@ -1,4 +1,5 @@
 import {
+  DEFAULT_CONFIG,
   loadRemoteConfig,
   resolveOverlayApiPrefix,
   resolveSiteUrl,
@@ -55,11 +56,11 @@ async function ensureCaptionScript(tabId) {
   }
 }
 
-// Public pricing site (must match SITE_URL in both
-// caption-overlay/lib/supabase-config.js and website/site-config.js).
+// Public pricing site (from DEFAULT_CONFIG in remote-config.mjs; the
+// overlay's classic supabase-config.js mirrors the same value).
 // The overlay builds the upgrade URL with the account attached; the worker
 // opens it only when it stays on this origin.
-const SITE_URL = "http://localhost:8080";
+const SITE_URL = DEFAULT_CONFIG.site_url;
 
 // Captify only works signed in. The overlay's user store persists its
 // state under this key (caption-overlay/lib/user-store.js); the worker is
@@ -357,9 +358,9 @@ async function openSigninPage(tabId) {
 // page origin, no preflight block); auth stays with the overlay (it owns
 // the token and passes it as a header, same as its direct fetches did).
 // Only backend-API URLs go out (mirrors the upgrade allow-list below) —
-// keep OVERLAY_API_PREFIX in sync with BACKEND_BASE_URL in
-// caption-overlay/lib/supabase-config.js.
-const OVERLAY_API_PREFIX = "http://127.0.0.1:8000/api/";
+// from DEFAULT_CONFIG in remote-config.mjs (derived from the same
+// backend_base_url as the overlay's BACKEND_BASE_URL).
+const OVERLAY_API_PREFIX = DEFAULT_CONFIG.overlay_api_prefix;
 
 // Over-the-air backend/redirect URLs (see src/remote-config.mjs). The
 // storage cache holds the last validated hosted document; the packaged

@@ -10,6 +10,10 @@
 (function () {
   const NS = (window.CaptifyOverlay = window.CaptifyOverlay || {});
 
+  // Baked-in defaults mirror DEFAULT_CONFIG in src/remote-config.mjs
+  // (single source of truth). This classic script can't import ESM —
+  // content scripts must stay import-free — so keep the values below in
+  // sync with it; tests/config-sync.test.mjs enforces this.
   NS.captifyConfig = {
     SUPABASE_URL: "https://hsuuleiisdgbidbwkqae.supabase.co",
     SUPABASE_ANON_KEY: "sb_publishable_namQsShONsZJviiyWtulnA_wZ4NWUPW",
@@ -19,6 +23,14 @@
     // ?email=, ?user_id=) so checkout links carry the user id in metadata.
     SITE_URL: "http://localhost:8080",
   };
+
+  // Local development switch. Must match DEV_FORCE_LOCAL_BACKEND in
+  // src/remote-config.mjs (same import-free mirror as the URLs above):
+  // true forces the localhost backend everywhere — applyRemoteConfig and
+  // loadRemoteConfig below become no-ops so a stale storage cache can't
+  // point the overlay at the hosted backend mid-dev. Flip back to false
+  // before publishing, together with the module flag.
+  NS.captifyConfig.DEV_FORCE_LOCAL_BACKEND = true;
 
   NS.captifyConfig.quotaUrl = function () {
     return `${NS.captifyConfig.BACKEND_BASE_URL.replace(/\/$/, "")}/api/v1/me/quota`;
@@ -51,6 +63,9 @@
   // Same rule as the module validator: https: URLs, http: loopback only,
   // unknown fields ignored, never throws.
   NS.captifyConfig.applyRemoteConfig = function (obj) {
+    // Dev mode pins the localhost backend: never apply remote overrides,
+    // even when a stale hosted document sits in the storage cache.
+    if (NS.captifyConfig.DEV_FORCE_LOCAL_BACKEND) return false;
     if (!obj || typeof obj !== "object" || Array.isArray(obj)) return false;
     let changed = false;
     const setUrl = (key, value) => {
@@ -85,8 +100,10 @@
   };
 
   // Reads the service worker's validated cache. False means "keep the
-  // baked-in defaults" (offline, or no fetch has landed yet).
+  // baked-in defaults" (offline, no fetch has landed yet, or dev mode
+  // pins the localhost backend via DEV_FORCE_LOCAL_BACKEND above).
   NS.captifyConfig.loadRemoteConfig = async function () {
+    if (NS.captifyConfig.DEV_FORCE_LOCAL_BACKEND) return false;
     try {
       const res = await chrome.storage?.local?.get("captifyRemoteConfig");
       return NS.captifyConfig.applyRemoteConfig(res?.captifyRemoteConfig);

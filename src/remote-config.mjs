@@ -24,7 +24,24 @@ export const REMOTE_CONFIG_TIMEOUT_MS = 8000;
 // backend everywhere: loadRemoteConfig returns null and every resolve*
 // helper falls through to its localhost fallback. No hosted fetch, no cache
 // read. Flip back to false before publishing.
-export const DEV_FORCE_LOCAL_BACKEND = false;
+export const DEV_FORCE_LOCAL_BACKEND = true;
+
+// Canonical baked-in defaults: the localhost backend every caller falls
+// back to when no remote document is available (dev mode, offline first
+// run, unreachable host). Single source of truth — the ESM callers
+// (rtc-config.js, service-worker.js) import this; the classic overlay
+// script (caption-overlay/lib/supabase-config.js) can't import ESM so it
+// mirrors these values (tests/config-sync.test.mjs keeps them in sync).
+export const DEFAULT_CONFIG = Object.freeze({
+  backend_base_url: "http://127.0.0.1:8000",
+  signal_url: "http://127.0.0.1:8000/api/v1/transcription/webrtc/offer",
+  overlay_api_prefix: "http://127.0.0.1:8000/api/",
+  site_url: "http://localhost:8080",
+  supabase_url: "https://hsuuleiisdgbidbwkqae.supabase.co",
+  supabase_anon_key: "sb_publishable_namQsShONsZJviiyWtulnA_wZ4NWUPW",
+  ice_servers: Object.freeze([]),
+  data_channel_label: "audio",
+});
 
 const MAX_ICE_SERVERS = 8;
 
